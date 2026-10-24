@@ -1,0 +1,57 @@
+[project]
+name = "home-jarvis"
+version = "0.1.0"
+description = "家庭版语音管家：连续对话 + 上下文关联 + 直接控制米家设备（DeepSeek + Home Assistant + sherpa-onnx）"
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+requires-python = ">=3.10"
+authors = [{ name = "zcweng" }]
+keywords = ["voice-assistant", "smart-home", "mijia", "home-assistant", "deepseek", "sherpa-onnx", "asr", "tts", "wake-word"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Intended Audience :: End Users/Desktop",
+    "License :: OSI Approved :: MIT License",
+    "Natural Language :: Chinese (Simplified)",
+    "Operating System :: MacOS",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Home Automation",
+    "Topic :: Multimedia :: Sound/Audio :: Speech",
+]
+dependencies = [
+    "sounddevice>=0.4.6",
+    "numpy>=1.26",
+    "soxr>=0.3.7",
+    "httpx>=0.27",
+    "pyyaml>=6.0",
+]
+
+[project.optional-dependencies]
+# 按阶段安装，保持 P0 依赖面最小；装齐用 `uv sync --extra asr --extra vad --extra kws`
+asr = ["sherpa-onnx>=1.10"]      # SenseVoice 识别 + 本地 VITS 合成都走它
+vad = ["onnxruntime>=1.18"]      # silero-vad 断句
+kws = ["pypinyin>=0.51"]         # 专用唤醒词：中文转拼音 token
+
+[project.urls]
+Homepage = "https://github.com/zcweng/home-jarvis"
+Repository = "https://github.com/zcweng/home-jarvis"
+Issues = "https://github.com/zcweng/home-jarvis/issues"
+Documentation = "https://github.com/zcweng/home-jarvis/tree/main/docs"
+
+[tool.uv]
+# 不是可安装包，只是脚本集合（代码直接用 `python -m jarvis.app` 跑）
+package = false
+
+[tool.ruff]
+line-length = 120
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I"]
+ignore = ["E501"]

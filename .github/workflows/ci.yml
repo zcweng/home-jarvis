@@ -1,0 +1,61 @@
+name: CI
+
+# 只跑「离线、无需音频设备」的检查：编译 + 纯 Python 断言。
+# 完整回归（音频/唤醒/真设备/真模型）要本机声卡、Home Assistant 与 DeepSeek key，
+# 见 README 的 `./scripts/selftest_all.sh`，不适合放进公共 CI。
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  offline-checks:
+    name: 离线检查（Py ${{ matrix.python-version }}）
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: 装最小依赖（CI 只需要 yaml）
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install pyyaml
+
+      - name: 语法编译（jarvis + scripts 全部模块）
+        run: python -m compileall -q jarvis scripts
+
+      - name: 文本归一化断言（数字/单位/时间必须是中文读法）
+        run: python scripts/selftest_tts_text.py --pure
+
+      - name: 别名表命名/房间逻辑自检
+        run: python scripts/gen_aliases.py --selftest
+
+      - name: 别名模板可解析且字段齐全
+        run: |
+          python - <<'EOF'
+          import yaml
+          d = yaml.safe_load(open("config/aliases.example.yaml", encoding="utf-8"))
+          assert isinstance(d, dict) and d, "模板为空"
+          for name, item in d.items():
+              assert "entity" in item, f"{name} 缺 entity"
+              assert item["entity"].split(".")[0] in {
+                  "light", "switch", "climate", "cover", "media_player", "notify", "button", "sensor"
+              }, f"{name} 的域不常见：{item['entity']}"
+              assert "type" in item, f"{name} 缺 type"
+          print(f"模板 OK：{len(d)} 台设备")
+          EOF

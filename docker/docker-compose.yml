@@ -1,0 +1,27 @@
+# Home Assistant —— 家电控制层
+# 用途：接入小米官方米家集成，给 jarvis 的工具层提供统一 REST API
+# 起服务：docker compose -f docker/docker-compose.yml up -d
+# 看日志：docker compose -f docker/docker-compose.yml logs -f homeassistant
+# 停止：  docker compose -f docker/docker-compose.yml down
+
+services:
+  homeassistant:
+    image: ghcr.io/home-assistant/home-assistant:stable
+    container_name: homeassistant
+    restart: unless-stopped
+    # macOS 上不用 network_mode: host（Docker Desktop 的 host 网络行为不可靠），
+    # 端口映射足够；米家集成走云端 OAuth，不依赖 mDNS 发现。
+    ports:
+      - "8123:8123"
+    volumes:
+      # HA 全部数据（含米家集成写入的小米 token，明文）—— 已加进 .gitignore
+      - ./config:/config
+      - /etc/localtime:/etc/localtime:ro
+    environment:
+      - TZ=Asia/Shanghai
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request;urllib.request.urlopen('http://127.0.0.1:8123/manifest.json', timeout=5)"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s

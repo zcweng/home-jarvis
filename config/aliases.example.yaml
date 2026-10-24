@@ -1,0 +1,63 @@
+# 设备别名表模板：中文口语 → Home Assistant entity_id
+#
+# ★ 这份文件里的 entity_id 全是**占位示例**，必须换成你自己 HA 里的真实值。★
+#
+# 用法（二选一）：
+#   A. 自动生成（推荐）：装好米家集成后从 HA 拉取真实实体
+#        python scripts/gen_aliases.py --dry-run    # 先看会认领哪些设备，不写文件
+#        python scripts/gen_aliases.py              # 确认后追加写入 config/aliases.yaml
+#   B. 手动抄样板：
+#        cp config/aliases.example.yaml config/aliases.yaml
+#        然后把下面的 entity 换成 https://your-ha:8123/developer-tools/state 里看到的真实 entity_id
+#
+# config/aliases.yaml 已被 .gitignore 忽略：每家的设备都不一样，不该进仓库。
+#
+# 字段：
+#   entity   Home Assistant 里的 entity_id（必填）
+#   type     设备域：light | switch | climate | cover | media_player（决定调哪个 service）
+#   room     房间名，可选；仅用于同名设备消歧，名字里已经带房间时不要再写
+#   aliases  口语别名列表，可选；匹配优先级：名字精确 > 别名精确 > 子串
+#
+# 设计约定：
+#   - 只放「家人真的会说出口」的设备。别名表越长，模型选错的概率越高。
+#   - 已收录的设备即使临时离线也不要删：gen_aliases.py 重跑 / --rebuild 会保留它并标记 [离线]。
+
+客厅灯:
+  entity: light.yeelink_cn_100000001_ceiling_s_2_light
+  type: light
+  room: 客厅
+  aliases: [客厅主灯, 客厅吸顶灯, 大厅灯]
+
+吸顶灯:
+  entity: light.yeelink_cn_100000002_ceiling3_s_2_light
+  type: light
+  aliases: [主卧吸顶灯, 灯]
+
+空调:
+  entity: climate.zhimi_cn_100000003_za1
+  type: climate
+  aliases: [空调]
+
+智能插座:
+  entity: switch.chuangmi_cn_100000004_m3_on_p_2_1
+  type: switch
+  aliases: [小米米家智能插座WiFi版, 开关]
+
+晾衣架:
+  entity: cover.hyd_cn_100000005_znlyj1_s_2_airer
+  type: cover
+  aliases: [晾衣架]
+
+# 音箱：announce 工具会自动发现带 play_text 的 notify 实体；
+# 在这里收录音箱本体后，可以说「大声点/用它说」这类指名播报。
+小爱音箱:
+  entity: media_player.xiaomi_cn_100000006_oh2p
+  type: media_player
+  aliases: [Xiaomi 智能音箱 Pro, 音箱]
+
+# 播报相关：勿扰打开时音箱不会念「播放文本」，用户可以口头关掉它。
+# 型号不同实体名不同，用 gen_aliases.py 拉取，或到 HA「开发者工具 → 状态」里搜 no_disturb。
+小爱勿扰:
+  entity: switch.xiaomi_cn_100000006_oh2p_no_disturb_p_9_1
+  type: switch
+  aliases: [勿扰模式, 小爱静音]

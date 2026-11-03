@@ -42,12 +42,26 @@ def looks_like_state_question(text: str) -> bool:
     return bool(_QUESTION.search(t) or re.search(r"(开着|关着|状态|几度)", t))
 
 
+# 天气专用（中国气象局工具）；与 web_search 分流
+_WEATHER = re.compile(r"(天气|气温|下雨|下雪|雨雪|预报|几度|穿什么|带伞|湿度|风力|冷不冷|热不热)")
+
 # 需要联网的时效/外部事实（宁可多判；误判只会多一次搜索）
 _WEB = re.compile(
-    r"(天气|气温|下雨|下雪|预报|新闻|头条|热搜|股价|汇率|比分|"
+    r"(新闻|头条|热搜|股价|汇率|比分|"
     r"几点|营业|门票|攻略|好玩|怎么走|多少钱|最新|今天|明天|昨天|"
-    r"查一下|搜一下|网上|百度|百科|谁是|哪年|发生了什么)"
+    r"查一下|搜一下|网上|百度|百科|谁是|哪年|发生了什么|"
+    r"天气|气温|下雨|下雪|预报)"  # 天气工具关闭时仍可走搜索兜底
 )
+
+
+def looks_like_weather(text: str) -> bool:
+    """是否像查天气（用于强制调 weather 工具）。"""
+    t = (text or "").strip()
+    if not t:
+        return False
+    if looks_like_command(t):
+        return False
+    return _WEATHER.search(t) is not None
 
 
 def looks_like_web_search(text: str) -> bool:

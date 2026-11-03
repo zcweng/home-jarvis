@@ -114,7 +114,7 @@ def _fetch(url: str, params: dict[str, str], ua: str, timeout: float) -> str:
         return r.text
 
 
-def search(query: str, *, count: int = 5, timeout: float = 5.0) -> str:
+def search(query: str, *, count: int = 5, timeout: float = 3.0) -> str:
     """搜百度，返回给模型的短中文素材；失败返回 FAIL 固定句。"""
     q = (query or "").strip()
     if not q:

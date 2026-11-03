@@ -55,19 +55,19 @@ def main() -> int:
     hit, idx = feed(det, tone(0.02, 3000))
     check("纯回声不自断", not hit, f"基线 {det.last_baseline_db:.1f}dBFS 当前 {det.last_level_db:.1f}dBFS")
 
-    # ② 回声 + 400ms 大音量人声：应触发
+    # ② 回声 + 600ms 大音量人声：应触发（门限 500ms）
     det = BargeInDetector(BargeInConfig())
-    pcm = np.concatenate([tone(0.02, 1200), tone(0.25, 400)])
+    pcm = np.concatenate([tone(0.02, 1200), tone(0.25, 600)])
     hit, idx = feed(det, pcm)
     lat_ms = (idx * BLOCK) / SR * 1000 - 1200 if hit else -1
     check("叠加人声能打断", hit, f"额外延迟 {lat_ms:.0f}ms" if hit else "未触发")
-    check("打断延迟 <600ms", 0 <= lat_ms < 600, f"{lat_ms:.0f}ms")
+    check("打断延迟 <800ms", 0 <= lat_ms < 800, f"{lat_ms:.0f}ms")
 
     # ③ 短促噪声（150ms，像键盘声）：不应触发
     det = BargeInDetector(BargeInConfig())
     pcm = np.concatenate([tone(0.02, 1200), tone(0.25, 150), tone(0.02, 800)])
     hit, _ = feed(det, pcm)
-    check("短噪声不误触发", not hit, "150ms 未达 300ms 门限")
+    check("短噪声不误触发", not hit, "150ms 未达 500ms 门限")
 
     # ④ 回声整体变大（用户调大音量）：自适应基线应跟上，不误触
     det = BargeInDetector(BargeInConfig())

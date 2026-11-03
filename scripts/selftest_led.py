@@ -33,11 +33,12 @@ def main() -> int:
     led = S12Led(host, port, enabled=True)
     seq = [
         ("idle", "熄灭"),
-        ("listen", "绿色呼吸"),
-        ("think", "蓝色呼吸（原厂）"),
+        ("listen", "常亮蓝（已唤醒）"),
+        ("think", "蓝色呼吸（LLM/搜索）"),
         ("speak", "固定蓝"),
         ("error", "红色呼吸"),
-        ("idle", "熄灭"),
+        ("mute", "黄色呼吸（麦禁用）"),
+        ("unmute", "熄灭（麦启用）"),
     ]
     print(f"灯环演示 → {host}（SSH /data/jarvis-led-set.sh）")
     ok_all = True
@@ -48,6 +49,17 @@ def main() -> int:
             print(f"    ❌ 下发失败", flush=True)
             ok_all = False
         time.sleep(args.hold)
+
+    print("音量弧（蓝灯分段）:", flush=True)
+    for pct in (0, 25, 50, 75, 100):
+        n = (pct * 12 + 50) // 100
+        print(f"  → volume {pct}%（约 {n}/12 灯）", flush=True)
+        ok = led.volume_blocking(pct)  # type: ignore[attr-defined]
+        if not ok:
+            print("    ❌ 下发失败", flush=True)
+            ok_all = False
+        time.sleep(args.hold)
+
     led.set_blocking("idle")  # type: ignore[attr-defined]
     print("完成" if ok_all else "有失败项")
     return 0 if ok_all else 1

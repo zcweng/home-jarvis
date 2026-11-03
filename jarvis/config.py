@@ -60,6 +60,7 @@ class Settings:
     ha_token: str = ""
     llm_model: str = "deepseek-flash"
     llm_base_url: str = "https://api.deepseek.com"
+    llm_timeout: float = 3.0
     deepseek_key: str = ""
     # 音频
     input_device: str = "外置麦克风"
@@ -68,9 +69,11 @@ class Settings:
     audio_source: str = "local"
     speaker_endpoint: str = "192.168.1.3"  # host 或 tcp://host:8765（上行）
     speaker_down_port: int = 8766          # 下行 PCM 端口
-    # S12 灯环（设备端 tools/s12led/ledd.sh，UDP）
+    # S12 灯环 / 音量（设备端 tools/s12led）
     led_enabled: bool = True
     led_port: int = 8767
+    volume_percent: int = 70
+    volume_udp_port: int = 8769
     # ASR
     asr_model_dir: str = "models/sensevoice"
     asr_language: str = "zh"
@@ -95,7 +98,7 @@ class Settings:
     kws_model: str = "models/sherpa-onnx-kws-zipformer-wenetspeech-3.3M-2024-01-01"
     # 打断与首句
     ack_phrases: str = "好的|嗯|收到"
-    barge_in_margin_db: float = 12.0
+    barge_in_margin_db: float = 18.0
     # 语音输出路由：speaker（小爱优先）| local（电脑喇叭）| both
     tts_target: str = "speaker"
     speaker_fallback_local: bool = True
@@ -107,7 +110,11 @@ class Settings:
     # 网页搜索（百度 SERP 抓取，无 API key）
     web_search_enabled: bool = False
     web_search_count: int = 5
-    web_search_timeout: float = 5.0
+    web_search_timeout: float = 3.0
+    # 天气（中国气象局 weather.cma.cn，无 API key）
+    weather_enabled: bool = True
+    weather_timeout: float = 3.0
+    weather_default_city: str = "成都"
 
     @classmethod
     def load(cls) -> Settings:
@@ -117,6 +124,7 @@ class Settings:
             ha_token=_env("HA_TOKEN", cls.ha_token),
             llm_model=_env("LLM_MODEL", cls.llm_model),
             llm_base_url=_env("LLM_BASE_URL", cls.llm_base_url),
+            llm_timeout=_env_float("LLM_TIMEOUT", cls.llm_timeout),
             deepseek_key=_env("DEEPSEEK_KEY", cls.deepseek_key),
             input_device=_env("INPUT_DEVICE", cls.input_device),
             output_device=_env("OUTPUT_DEVICE", cls.output_device),
@@ -125,6 +133,8 @@ class Settings:
             speaker_down_port=_env_int("SPEAKER_DOWN_PORT", cls.speaker_down_port),
             led_enabled=_env("LED_ENABLED", "true").lower() in ("1", "true", "yes"),
             led_port=_env_int("LED_PORT", cls.led_port),
+            volume_percent=_env_int("VOLUME_PERCENT", cls.volume_percent),
+            volume_udp_port=_env_int("VOLUME_UDP_PORT", cls.volume_udp_port),
             asr_model_dir=_env("ASR_MODEL_DIR", cls.asr_model_dir),
             asr_language=_env("ASR_LANGUAGE", cls.asr_language),
             tts_backend=_env("TTS_BACKEND", cls.tts_backend),
@@ -153,6 +163,9 @@ class Settings:
             web_search_enabled=_env("WEB_SEARCH_ENABLED", "false").lower() in ("1", "true", "yes"),
             web_search_count=_env_int("WEB_SEARCH_COUNT", cls.web_search_count),
             web_search_timeout=_env_float("WEB_SEARCH_TIMEOUT", cls.web_search_timeout),
+            weather_enabled=_env("WEATHER_ENABLED", "true").lower() in ("1", "true", "yes"),
+            weather_timeout=_env_float("WEATHER_TIMEOUT", cls.weather_timeout),
+            weather_default_city=_env("WEATHER_DEFAULT_CITY", cls.weather_default_city),
         )
 
     def require_ha(self) -> None:

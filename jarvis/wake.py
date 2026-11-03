@@ -159,31 +159,70 @@ class WakeGate:
         self._holding = False
         self._last_wake = 0.0
 
-    def feed(self, text: str) -> tuple[bool, str]:
-        """判断这句话是否该响应。
+    def _strip_wake(self, cleaned: str, *, loose: bool = False) -> str | None:
+        """若含唤醒词，返回其后指令（可能为空）；否则 None。
 
-        返回 (是否响应, 去除唤醒词后的指令)。
-        - 在连续对话窗口内：任何话都响应
-        - 否则必须包含唤醒词；唤醒词后面的部分若不为空，直接当指令
+        loose：仅在已开窗时启用——句首两字允许 1 处替换（「小贾」→「小蒋」），
+        避免 KWS 已唤醒但 ASR 近音导致整句进 LLM。
         """
-        t = (text or "").strip()
-        if not t:
-            return False, ""
-
-        if self.awake:
-            self.touch()
-            return True, t
-
-        cleaned = _clean(t)
         for word in self.words:
             span = _fuzzy_index(cleaned, word)
+            if span is None and loose and len(word) == 2 and len(cleaned) >= 2:
+                if _lev(cleaned[:2], word) <= 1:
+                    span = (0, 2)
             if span is None:
                 continue
             _start, end = span
             rest = cleaned[end:]
             for filler in _FILLERS:
                 rest = rest[len(filler) :] if rest.startswith(filler) else rest
+            return rest.strip()
+        return None
+
+    def _wake_only(self, cleaned: str, *, loose: bool = False) -> bool:
+        """整句只是唤醒词（或近音），没有后续指令。"""
+        if not cleaned:
+            return True
+        for word in self.words:
+            if cleaned == word:
+                return True
+            n = len(word)
+            if n >= 3 and abs(len(cleaned) - n) <= 1 and len(cleaned) >= n:
+                if _fuzzy_index(cleaned[:n], word) is not None and len(cleaned) <= n + 1:
+                    return True
+            # 近音仅在已开窗时放开，避免冷启动把「小蒋」当唤醒
+            if loose and n == 2 and len(cleaned) == 2 and _lev(cleaned, word) <= 1:
+                return True
+        return False
+
+    def feed(self, text: str) -> tuple[bool, str]:
+        """判断这句话是否该响应。
+
+        返回 (是否响应, 去除唤醒词后的指令)。
+        - 含唤醒词：剥掉后当指令（纯唤醒 → 空串，由上层回「我在」）
+        - 已在连续对话窗口且无唤醒词：整句当指令
+        - 否则不响应
+
+        注意：KWS 会先 touch 开窗再等 VAD+ASR。若此处因 awake 直接原样放行，
+        纯「小贾。」会整句进 LLM。已开窗时仍必须剥唤醒词。
+        """
+        t = (text or "").strip()
+        if not t:
+            return False, ""
+
+        cleaned = _clean(t)
+        rest = self._strip_wake(cleaned)
+        if rest is None and self.awake:
+            rest = self._strip_wake(cleaned, loose=True)
+        if rest is not None:
             self.touch()
-            return True, rest.strip()
+            return True, rest
+        if self._wake_only(cleaned, loose=self.awake):
+            self.touch()
+            return True, ""
+
+        if self.awake:
+            self.touch()
+            return True, cleaned
 
         return False, ""

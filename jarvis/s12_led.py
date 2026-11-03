@@ -1,6 +1,8 @@
 """S12 灯环客户端：SSH 调用设备端 /data/jarvis-led-set.sh。
 
-状态约定：idle / listen / think / speak / error
+状态约定：
+  idle=熄灭 · listen=唤醒常亮蓝 · think=蓝呼吸（LLM/搜索）
+  speak=常亮蓝 · error=红 · mute/unmute=黄呼吸/熄灭
 """
 
 from __future__ import annotations
@@ -10,7 +12,7 @@ import sys
 import threading
 from typing import Literal
 
-LedState = Literal["idle", "listen", "think", "speak", "error"]
+LedState = Literal["idle", "listen", "think", "speak", "error", "mute", "unmute"]
 
 REMOTE_SET = "/data/jarvis-led-set.sh"
 SSH_OPTS = [
@@ -68,9 +70,32 @@ class S12Led:
             self._state = state
         return self._send(state, timeout=timeout)
 
+    def volume(self, pct: int) -> None:
+        """蓝色灯弧：pct% → 点亮约 pct/100*12 颗灯。异步。"""
+        if not self.enabled:
+            return
+        p = max(0, min(100, int(pct)))
+        with self._lock:
+            self._state = None  # 允许随后再切回 listen 等
+        threading.Thread(target=self._send_volume, args=(p,), daemon=True).start()
+
+    def volume_blocking(self, pct: int, timeout: float = 5.0) -> bool:
+        if not self.enabled:
+            return False
+        return self._send_volume(max(0, min(100, int(pct))), timeout=timeout)
+
+    def mute(self, muted: bool = True) -> None:
+        self.set("mute" if muted else "unmute")
+
     def _send(self, state: LedState, timeout: float = 4.0) -> bool:
+        return self._remote(f"{REMOTE_SET} {state}", label=state, timeout=timeout)
+
+    def _send_volume(self, pct: int, timeout: float = 4.0) -> bool:
+        return self._remote(f"{REMOTE_SET} volume {pct}", label=f"volume {pct}", timeout=timeout)
+
+    def _remote(self, argv: str, *, label: str, timeout: float) -> bool:
         with self._busy:
-            remote = f"export PATH=/usr/sbin:/usr/bin:/sbin:/bin; {REMOTE_SET} {state}"
+            remote = f"export PATH=/usr/sbin:/usr/bin:/sbin:/bin; {argv}"
             cmd = ["ssh", *SSH_OPTS, f"{self.user}@{self.host}", remote]
             try:
                 r = subprocess.run(
@@ -82,11 +107,11 @@ class S12Led:
                 )
                 if r.returncode != 0:
                     err = (r.stderr or r.stdout or "").strip()[:120]
-                    print(f"⚠️  灯环 {state} rc={r.returncode} {err}", file=sys.stderr)
+                    print(f"⚠️  灯环 {label} rc={r.returncode} {err}", file=sys.stderr)
                     return False
                 return True
             except Exception as e:  # noqa: BLE001
-                print(f"⚠️  灯环 {state} 失败：{e}", file=sys.stderr)
+                print(f"⚠️  灯环 {label} 失败：{e}", file=sys.stderr)
                 return False
 
 
@@ -96,6 +121,15 @@ class NullLed:
 
     def set_blocking(self, state: str, timeout: float = 5.0) -> bool:  # noqa: ARG002
         return False
+
+    def volume(self, pct: int) -> None:  # noqa: ARG002
+        return
+
+    def volume_blocking(self, pct: int, timeout: float = 5.0) -> bool:  # noqa: ARG002
+        return False
+
+    def mute(self, muted: bool = True) -> None:  # noqa: ARG002
+        return
 
     def close(self) -> None:
         return

@@ -198,7 +198,8 @@ class Mic:
             return np.zeros(0, dtype=np.float32)
         return np.concatenate(chunks)[:need]
 
-    def drain(self) -> None:
+    def drain(self, seconds: float = 0.0) -> None:  # noqa: ARG002
+        """清空队列。seconds 仅为与 EndpointMic 对齐，本机麦忽略。"""
         while True:
             try:
                 self._q.get_nowait()

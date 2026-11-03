@@ -52,6 +52,16 @@ def main() -> int:
     # ③ 只有唤醒词 → 空指令（应回复"我在，说吧"）
     woke, cmd = fresh().feed("管家")
     check("仅唤醒词", woke and cmd == "", f"cmd={cmd!r}")
+    woke, cmd = fresh().feed("小贾。")
+    check("仅唤醒词带句号", woke and cmd == "", f"cmd={cmd!r}")
+
+    # KWS 先 touch 开窗，再 ASR 到纯唤醒词：必须剥掉，不能整句进 LLM
+    gk = WakeGate(follow_up_seconds=8.0)
+    gk.touch()
+    woke, cmd = gk.feed("小贾。")
+    check("KWS 开窗后纯唤醒不进 LLM", woke and cmd == "", f"woke={woke} cmd={cmd!r}")
+    woke, cmd = gk.feed("小贾今天几号")
+    check("KWS 开窗后同句指令剥离", woke and cmd == "今天几号", f"cmd={cmd!r}")
 
     # ④ 连续对话窗口
     g = WakeGate(follow_up_seconds=1.0)

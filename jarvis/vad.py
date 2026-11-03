@@ -48,17 +48,31 @@ class Segmenter:
         if not model_path.exists():
             raise SystemExit(f"缺少 VAD 模型：{model_path}\n先执行 ./scripts/fetch_models.sh silero-vad")
 
+        self._model_path = str(model_path)
+        self._threshold = threshold
+        self._min_silence = min_silence
+        self._min_speech = min_speech
+        self._max_speech = max_speech
+        self._buffer_seconds = buffer_seconds
+        self.min_silence = min_silence
+        self._vad = self._make_vad()
+
+    def _make_vad(self):
+        import sherpa_onnx
+
         cfg = sherpa_onnx.VadModelConfig()
-        cfg.silero_vad.model = str(model_path)
-        cfg.silero_vad.threshold = threshold
-        cfg.silero_vad.min_silence_duration = min_silence
-        cfg.silero_vad.min_speech_duration = min_speech
-        cfg.silero_vad.max_speech_duration = max_speech
+        cfg.silero_vad.model = self._model_path
+        cfg.silero_vad.threshold = self._threshold
+        cfg.silero_vad.min_silence_duration = self._min_silence
+        cfg.silero_vad.min_speech_duration = self._min_speech
+        cfg.silero_vad.max_speech_duration = self._max_speech
         cfg.silero_vad.window_size = 512
         cfg.sample_rate = TARGET_RATE
+        return sherpa_onnx.VoiceActivityDetector(cfg, buffer_size_in_seconds=self._buffer_seconds)
 
-        self._vad = sherpa_onnx.VoiceActivityDetector(cfg, buffer_size_in_seconds=buffer_seconds)
-        self.min_silence = min_silence
+    def reset(self) -> None:
+        """清空内部缓冲（唤醒后丢弃「我在」前回声，避免假切句）。"""
+        self._vad = self._make_vad()
 
     def accept(self, pcm: np.ndarray) -> list[np.ndarray]:
         """喂一块 16k float32，返回本次切出来的完整语音段（可能为空）。"""

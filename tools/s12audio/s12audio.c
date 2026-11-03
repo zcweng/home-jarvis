@@ -40,6 +40,9 @@
 #include <time.h>
 #include <unistd.h>
 
+#include "vol_dong_pcm.h"
+#include "mute_sfx_pcm.h"
+
 // --------------------------------------------------------------------------- 常量
 
 #define CAP_CH 8
@@ -89,6 +92,11 @@ static int g_ns_on = 1;
 static int g_agc_on = 0;
 static int g_gain_post_db = 0;
 static double g_vol = 1.0;
+static int g_vol_pct = -1; /* -1=尚未同步；播放线程轮询 /tmp/jarvis-vol.pct */
+static volatile int g_mic_muted = 0;
+#define VOL_PCT_FILE "/tmp/jarvis-vol.pct"
+#define MUTE_FILE "/tmp/jarvis-mic.mute"
+#define VOL_MIN_PCT 5
 
 static unsigned long g_upsent_drop;
 static unsigned long g_frames, g_upsent, g_downframes, g_flushes, g_overflows;
@@ -509,6 +517,8 @@ static void set_nodelay(int fd) {
   setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
 }
 
+static void mute_poll_file(void); /* 定义见音效段：边沿触发 Bottle/Funk */
+
 static void *uplink_thread(void *arg) {
   int lfd = *(int *)arg;
   while (!g_stop) {
@@ -523,8 +533,10 @@ static void *uplink_thread(void *arg) {
     static int16_t blk[FRAME_SAMPLES];
     while (!g_stop) {
       g_hb_up++;
+      mute_poll_file();
       int got = ring_read(&g_up_ring, blk, FRAME_SAMPLES, 200);
       if (got < FRAME_SAMPLES) continue;
+      if (g_mic_muted) memset(blk, 0, sizeof(blk));
       ssize_t n = send(cfd, blk, FRAME_BYTES_S16, MSG_NOSIGNAL);
       if (n < 0) {
         if (errno == EAGAIN || errno == EWOULDBLOCK) {
@@ -611,6 +623,146 @@ static void *downlink_thread(void *arg) {
   return NULL;
 }
 
+// --------------------------------------------------------------------------- 音量文件 + 本地提示音
+/* 提示音不走 play_ring：空闲时 ring 读超时会直接 continue，塞进 ring 常被丢掉。
+   改为独立缓冲，在 ALSA 写出前混入；无下行 PCM 时也强制写一帧。 */
+
+#if MUTE_SFX_MAX_LEN > VOL_DONG_LEN
+#define DONG_MAX_SAMPLES MUTE_SFX_MAX_LEN
+#else
+#define DONG_MAX_SAMPLES VOL_DONG_LEN
+#endif
+static int16_t g_dong_buf[DONG_MAX_SAMPLES];
+static int g_dong_len = 0;
+static int g_dong_pos = 0;
+static volatile int g_dong_kick = 0; /* 空闲起播时强制 prepare */
+static pthread_mutex_t g_dong_mu = PTHREAD_MUTEX_INITIALIZER;
+static int g_mic_mute_seen = -1; /* -1=尚未同步，边沿不响 */
+
+/* 本地提示音总增益（相对原先响度） */
+#define SFX_GAIN 0.5
+
+static double sfx_amp_for_pct(int pct) {
+  double level = (double)pct / 100.0;
+  if (level < 0.05) level = 0.05;
+  return (0.35 + 0.65 * (level * level)) * SFX_GAIN;
+}
+
+static void sfx_enqueue(const int16_t *pcm, int len, double amp) {
+  if (!pcm || len <= 0) return;
+  if (len > DONG_MAX_SAMPLES) len = DONG_MAX_SAMPLES;
+  pthread_mutex_lock(&g_dong_mu);
+  for (int i = 0; i < len; i++) {
+    int v = (int)lround((double)pcm[i] * amp);
+    if (v > 32767) v = 32767;
+    if (v < -32768) v = -32768;
+    g_dong_buf[i] = (int16_t)v;
+  }
+  g_dong_len = len;
+  g_dong_pos = 0;
+  g_dong_kick = 1;
+  pthread_mutex_unlock(&g_dong_mu);
+}
+
+static void vol_enqueue_dong(int pct) {
+  (void)pct;
+  /* 固定响度；Tink 极短，略抬一点以免被当成没声 */
+  sfx_enqueue(VOL_DONG_PCM, VOL_DONG_LEN, 0.9 * SFX_GAIN);
+}
+
+static void mute_poll_file(void) {
+  FILE *f = fopen(MUTE_FILE, "r");
+  int v = 0;
+  if (f) {
+    if (fscanf(f, "%d", &v) != 1) v = 0;
+    fclose(f);
+  }
+  v = v ? 1 : 0;
+  g_mic_muted = v;
+  if (g_mic_mute_seen < 0) {
+    g_mic_mute_seen = v;
+    return;
+  }
+  if (v == g_mic_mute_seen) return;
+  g_mic_mute_seen = v;
+  int pct = g_vol_pct >= 0 ? g_vol_pct : 70;
+  double amp = sfx_amp_for_pct(pct);
+  if (v) {
+    /* 禁用麦 → Bottle */
+    sfx_enqueue(MUTE_SFX_OFF_PCM, MUTE_SFX_OFF_LEN, amp);
+    logf_("麦克风禁用（Bottle）");
+  } else {
+    /* 启用麦 → Funk */
+    sfx_enqueue(MUTE_SFX_ON_PCM, MUTE_SFX_ON_LEN, amp);
+    logf_("麦克风启用（Funk）");
+  }
+}
+
+static int vol_mix_dong(int16_t *mono, int n) {
+  int mixed = 0;
+  pthread_mutex_lock(&g_dong_mu);
+  for (int i = 0; i < n && g_dong_pos < g_dong_len; i++) {
+    int v = (int)mono[i] + (int)g_dong_buf[g_dong_pos++];
+    if (v > 32767) v = 32767;
+    if (v < -32768) v = -32768;
+    mono[i] = (int16_t)v;
+    mixed = 1;
+  }
+  if (g_dong_pos >= g_dong_len) {
+    g_dong_len = 0;
+    g_dong_pos = 0;
+  }
+  pthread_mutex_unlock(&g_dong_mu);
+  return mixed;
+}
+
+static int vol_dong_pending(void) {
+  pthread_mutex_lock(&g_dong_mu);
+  int p = (g_dong_pos < g_dong_len);
+  pthread_mutex_unlock(&g_dong_mu);
+  return p;
+}
+
+/* 连续滑动算一次手势：响一次后上锁，停滑 ≥350ms 再解锁 */
+#define VOL_SFX_IDLE_SEC 0.35
+static int g_vol_sfx_armed = 1;
+static double g_vol_last_change_sec = 0;
+
+static double mono_sec(void) {
+  struct timeval tv;
+  gettimeofday(&tv, NULL);
+  return (double)tv.tv_sec + (double)tv.tv_usec * 1e-6;
+}
+
+static void vol_set_pct(int pct) {
+  if (pct < VOL_MIN_PCT) pct = VOL_MIN_PCT;
+  if (pct > 100) pct = 100;
+  if (pct == g_vol_pct) return;
+  int first = (g_vol_pct < 0);
+  g_vol_pct = pct;
+  /* 百分比线性增益，与灯弧一致 */
+  g_vol = (double)pct / 100.0;
+  g_vol_last_change_sec = mono_sec();
+  if (first) return; /* 开机同步不响 */
+  /* 同一手势只响一次；上一段还在播也不打断 */
+  if (!g_vol_sfx_armed || vol_dong_pending()) return;
+  g_vol_sfx_armed = 0;
+  vol_enqueue_dong(pct);
+  logf_("音量 %d%%（Tink）", pct);
+}
+
+static void vol_poll_file(void) {
+  FILE *f = fopen(VOL_PCT_FILE, "r");
+  if (!f) return;
+  int p = -1;
+  if (fscanf(f, "%d", &p) == 1 && p >= 0) vol_set_pct(p);
+  fclose(f);
+  if (!g_vol_sfx_armed &&
+      (mono_sec() - g_vol_last_change_sec) >= VOL_SFX_IDLE_SEC) {
+    g_vol_sfx_armed = 1;
+  }
+}
+
 // --------------------------------------------------------------------------- 播放
 
 static void *playback_thread(void *arg) {
@@ -618,21 +770,54 @@ static void *playback_thread(void *arg) {
   static int16_t mono[FRAME_SAMPLES];
   static int16_t stereo[FRAME_SAMPLES * 2];
   int prebuf = 0;
+  unsigned tick = 0;
 
   while (!g_stop) {
     g_hb_play++;
-    if (!prebuf) {
+    if ((tick++ % 5) == 0) {
+      vol_poll_file(); /* ~50ms */
+      mute_poll_file();
+    }
+
+    int dong = vol_dong_pending();
+    if (!prebuf && !dong) {
       if (ring_avail(&g_play_ring) < PLAY_PREBUF * FRAME_SAMPLES) {
         usleep(1000);
         continue;
       }
       prebuf = 1;
     }
-    int got = ring_read(&g_play_ring, mono, FRAME_SAMPLES, 50);
-    if (got < FRAME_SAMPLES) {
-      if (ring_avail(&g_play_ring) == 0) prebuf = 0;
+
+    memset(mono, 0, sizeof(mono));
+    int got = 0;
+    if (prebuf || ring_avail(&g_play_ring) > 0) {
+      got = ring_read(&g_play_ring, mono, FRAME_SAMPLES, dong ? 0 : 50);
+      if (got < FRAME_SAMPLES) {
+        if (ring_avail(&g_play_ring) == 0) prebuf = 0;
+        if (!dong && got <= 0) continue;
+        /* 有咚：不足一帧的部分保持 0，照样送 ALSA */
+      }
+    } else if (!dong) {
+      usleep(1000);
       continue;
     }
+
+    int mixed = vol_mix_dong(mono, FRAME_SAMPLES);
+    if (got < FRAME_SAMPLES && !mixed && !vol_dong_pending()) {
+      /* 既没 PCM 也没咚 */
+      usleep(1000);
+      continue;
+    }
+
+    if (g_dong_kick && g_pcm_play) {
+      g_dong_kick = 0;
+      /* 已在跑就不要 prepare：会丢掉短促提示音（Tink 有效声仅几十 ms） */
+      snd_pcm_state_t st = snd_pcm_state(g_pcm_play);
+      if (st != SND_PCM_STATE_RUNNING && st != SND_PCM_STATE_PREPARED) {
+        snd_pcm_prepare(g_pcm_play);
+      }
+    }
+
     // 硬件只播 index1，但两声道都写（与实测保持一致）
     for (int i = 0; i < FRAME_SAMPLES; i++) {
       stereo[i * 2] = mono[i];

@@ -25,10 +25,11 @@ from dataclasses import replace
 from pathlib import Path
 from typing import Any, Callable
 
+import httpx
 import numpy as np
 
 from .asr import SenseVoice
-from .audio import TARGET_RATE, Mic, Speaker, read_wav
+from .audio import TARGET_RATE, Mic, Speaker, read_wav, write_wav
 from .bargein import BargeInConfig, BargeInDetector
 from .config import Settings
 from .endpoint import (
@@ -38,7 +39,7 @@ from .endpoint import (
     parse_endpoint,
 )
 from .ha import HAClient
-from .intent import looks_like_command, looks_like_web_search
+from .intent import looks_like_command, looks_like_weather, looks_like_web_search
 from .llm import DeepSeek
 from .output import SpeechRouter
 from .session import Session
@@ -47,6 +48,7 @@ from .vad import Segmenter
 from .kws import DEFAULT_MODEL as KWS_DEFAULT_MODEL
 from .kws import KeywordWake
 from .s12_led import NullLed, S12Led
+from .volume import VolumeController
 from .wake import WakeGate, is_sleep_request
 
 
@@ -60,11 +62,12 @@ def chat_with_guard(
     on_tool_calls=None,
     *,
     web_search_enabled: bool = False,
+    weather_enabled: bool = False,
 ):
-    """调用模型；命令未调工具 / 联网问句未搜索时，强制重问一次。
+    """调用模型；命令未调工具 / 天气未查 / 联网问句未搜索时，强制重问一次。
 
     实测模型会凭上下文说"客厅灯已经关了"，却一次没调 control —— 灯根本没动。
-    也会直接说「没接天气」而不调 web_search。prompt 堵不住，编排层兜底。
+    也会直接说「没接天气」而不调工具。prompt 堵不住，编排层兜底。
     """
     res = llm.chat(messages, schemas, dispatch=dispatch, on_tool_calls=on_tool_calls)
     if res.tool_calls:
@@ -72,6 +75,8 @@ def chat_with_guard(
     force: str | None = None
     if looks_like_command(user_text):
         force = "control"
+    elif weather_enabled and looks_like_weather(user_text):
+        force = "weather"
     elif web_search_enabled and looks_like_web_search(user_text):
         force = "web_search"
     if not force:
@@ -114,10 +119,12 @@ class Jarvis:
         self._pending: list[np.ndarray] = []
         self._ack_phrases = [p.strip() for p in self.st.ack_phrases.split("|") if p.strip()]
         self._ack_idx = 0
+        self._early_acked = False
         self.interrupted = False
         self._asleep_notice_at = 0.0
         self._mic_factory, self._speaker, router_st, audio_label = self._build_audio()
         self.led = self._build_led()
+        self.volume = self._build_volume()
         print("加载模型…", file=sys.stderr)
         t0 = time.perf_counter()
         self.asr = SenseVoice(self.st.asr_model_dir, language=self.st.asr_language)
@@ -191,16 +198,91 @@ class Jarvis:
         led = S12Led(host, self.st.led_port, enabled=True)
         led.set("idle")
         print(
-            f"灯环：{host}:{self.st.led_port}（待命熄灭 / 聆听绿 / 思考蓝呼吸 / 播报蓝 / 出错红）",
+            f"灯环：{host}（待命熄灭 / 唤醒常亮蓝 / 思考蓝呼吸 / 播报蓝 / 出错红 / 麦禁用黄呼吸）",
             file=sys.stderr,
         )
         return led
 
+    @property
+    def mic_muted(self) -> bool:
+        return bool(self.volume and self.volume.muted)
+
     def _led(self, state: str) -> None:
+        # 麦禁用时设备端保持黄呼吸，Mac 侧不要抢灯
+        if self.mic_muted and state not in ("error",):
+            return
         try:
             self.led.set(state)  # type: ignore[arg-type]
         except Exception as e:  # noqa: BLE001
             print(f"⚠️  灯环 {state}：{e}", file=sys.stderr)
+
+    def _build_volume(self) -> VolumeController | None:
+        if not (_is_endpoint(self.st.audio_source) and isinstance(self._speaker, EndpointSpeaker)):
+            return None
+        host, _ = parse_endpoint(self.st.speaker_endpoint)
+        spk: EndpointSpeaker = self._speaker
+
+        def gain(b: int) -> bool:
+            return spk.set_volume_byte(b)
+
+        def led_vol(p: int) -> None:
+            if self.mic_muted:
+                return
+            self.led.volume(p)
+
+        def on_mute(muted: bool) -> None:
+            if muted:
+                # 黄灯由设备 volumed 本地下发；这里只清会话态
+                return
+            self._led("idle")
+
+        ctl = VolumeController(
+            gain,
+            led_vol,
+            initial=self.st.volume_percent,
+            listen_port=self.st.volume_udp_port,
+            on_mute=on_mute,
+        )
+        # 告诉设备「往哪发 UDP」；本机路由到音箱的源地址
+        try:
+            s = __import__("socket").socket(__import__("socket").AF_INET, __import__("socket").SOCK_DGRAM)
+            s.connect((host, 8765))
+            mac_ip = s.getsockname()[0]
+            s.close()
+        except OSError:
+            mac_ip = ""
+        if mac_ip:
+            import subprocess
+
+            subprocess.run(
+                [
+                    "ssh",
+                    "-o",
+                    "StrictHostKeyChecking=no",
+                    "-o",
+                    "UserKnownHostsFile=/dev/null",
+                    "-o",
+                    "BatchMode=yes",
+                    "-o",
+                    "ConnectTimeout=3",
+                    "-o",
+                    "HostKeyAlgorithms=+ssh-rsa",
+                    "-o",
+                    "PubkeyAcceptedKeyTypes=+ssh-rsa",
+                    f"root@{host}",
+                    f"export PATH=/usr/sbin:/usr/bin:/sbin:/bin; printf '%s\\n' '{mac_ip}' > /tmp/jarvis-mac.ip",
+                ],
+                check=False,
+                timeout=4,
+                capture_output=True,
+            )
+        ctl.set_percent(self.st.volume_percent, led=True)
+        ctl.start_udp_listener()
+        print(
+            f"音量：{self.st.volume_percent}%（环调节 → 蓝灯弧 + 播放增益；UDP :{self.st.volume_udp_port}）",
+            file=sys.stderr,
+        )
+        return ctl
 
     # ------------------------------------------------------------------ 一轮
 
@@ -222,13 +304,44 @@ class Jarvis:
         self.tts.play_cached(self._here_phrase, blocking=True)
         self._led("listen")
 
+    def _post_announce_listen(self, mic, seg) -> None:  # noqa: ANN001
+        """「我在」之后：排空回声 + 重置 VAD，避免把播报残段识别成「小小」之类。"""
+        drain_s = 0.4 if _is_endpoint(self.st.audio_source) else 0.15
+        try:
+            mic.drain(drain_s)
+        except TypeError:
+            mic.drain()
+        if hasattr(seg, "reset"):
+            seg.reset()
+
+    def _log_asr_utt(self, utt: np.ndarray, text: str, ms: float) -> None:
+        """ASR 旁路：时长/电平 + 落盘，方便对照误识别。"""
+        from .audio import dbfs as _dbfs
+
+        dur = float(utt.size) / TARGET_RATE
+        print(f"  🎙  ASR 段 {dur:.2f}s {_dbfs(utt):.0f}dBFS → 「{text}」 ({ms:.0f}ms)", flush=True)
+        try:
+            path = Path("debug/last_asr.wav")
+            path.parent.mkdir(parents=True, exist_ok=True)
+            write_wav(path, utt, TARGET_RATE)
+        except Exception as e:  # noqa: BLE001
+            print(f"  ⚠️  保存 last_asr.wav 失败：{e}", file=sys.stderr)
+        if dur < 0.35 and text.strip():
+            print("  ⚠️  切句过短，可能是回声/噪声（不是完整指令）", flush=True)
+
     def _early_ack(self, calls) -> None:  # noqa: ANN001
-        """工具刚决定、还没执行时先播一个短应答，掩盖第二轮的 600ms。"""
+        """工具刚决定、还没执行时先播一个短应答，掩盖第二轮的 600ms。
+
+        多轮 tool 循环（同一句用户话）只 ack 一次，避免「好的」「嗯」「收到」连播。
+        """
+        if self._early_acked:
+            return
         if not (self.speak_enabled and self._ack_phrases):
             return
         if self.tts.target == "speaker":
             # 云端 TTS 没法预渲染，硬插一句"好的"只会让两句话更慢更乱
             return
+        self._early_acked = True
         phrase = self._ack_phrases[self._ack_idx % len(self._ack_phrases)]
         self._ack_idx += 1
         # 端点模式用阻塞播：非阻塞会与终答抢 DownlinkWriter 锁导致死锁
@@ -255,7 +368,10 @@ class Jarvis:
 
     def handle_text(self, text: str, mic: Mic | None = None) -> str:
         """已经拿到文本时直接进思考+说话（唤醒门控走这条路，避免二次 ASR）。"""
+        self._early_acked = False
         self._led("think")
+        hint = self.llm.call_hint() if hasattr(self.llm, "call_hint") else ""
+        print(f"  🔗 LLM 调用：user=「{text}」 {hint}", flush=True)
         try:
             msgs = self.session.messages(text)
             schemas = self.tools.schemas()
@@ -268,7 +384,24 @@ class Jarvis:
                 on_retry=lambda: print("  ⚠️  未调工具，强制重问一次"),
                 on_tool_calls=self._early_ack,
                 web_search_enabled=self.st.web_search_enabled,
+                weather_enabled=self.st.weather_enabled,
             )
+        except httpx.TimeoutException as e:
+            print(f"  ⚠️  LLM 超时：{e}", file=sys.stderr)
+            return self._speak_network_glitch(mic)
+        except httpx.TransportError as e:
+            print(f"  ⚠️  LLM 网络错误：{e}", file=sys.stderr)
+            return self._speak_network_glitch(mic)
+        except RuntimeError as e:
+            # DeepSeek 忙/5xx 会走这里（_post 转成 RuntimeError）
+            msg = str(e)
+            if "HTTP 5" in msg or "too busy" in msg.lower() or "unavailable" in msg.lower():
+                print(f"  ⚠️  LLM 服务异常：{e}", file=sys.stderr)
+                return self._speak_network_glitch(mic)
+            self._led("error")
+            time.sleep(1.2)
+            self._led("listen")
+            raise
         except Exception:
             self._led("error")
             time.sleep(1.2)
@@ -301,9 +434,36 @@ class Jarvis:
         self._led("listen")
         return reply
 
+    def _speak_network_glitch(self, mic: Mic | None) -> str:
+        """LLM 超时/断网：播一句提示，不把主循环打崩。"""
+        reply = "网络遇到点问题"
+        self._led("error")
+        if self.speak_enabled:
+            try:
+                self.tts.wait_idle()
+                self._led("speak")
+                self.tts.speak(reply)
+            except Exception as e:  # noqa: BLE001
+                print(f"  ⚠️  网络提示播报失败：{e}", file=sys.stderr)
+        if mic is not None:
+            try:
+                mic.drain()
+            except Exception:  # noqa: BLE001
+                pass
+        self._led("listen")
+        print(f"  🤖 {reply}")
+        return reply
+
     def _speak_barge_in(self, text: str, mic: Mic) -> None:
         """边说边听：用户插话就立刻掐断播报，并把打断的那段音频留下来继续说。"""
-        det = BargeInDetector(BargeInConfig(margin_db=self.st.barge_in_margin_db))
+        det = BargeInDetector(
+            BargeInConfig(
+                margin_db=self.st.barge_in_margin_db,
+                min_speech_ms=500.0,
+                warmup_ms=400.0,
+                baseline_percentile=85.0,
+            )
+        )
         th = self.tts.speak(text, blocking=False)
         captured: list[np.ndarray] = []
         while th is not None and th.is_alive():
@@ -324,8 +484,6 @@ class Jarvis:
 
     def _barge_in_supported(self) -> bool:
         """云端播报（小爱）没法被打断，麦克风还会收到它的声音，所以音箱模式禁用 barge-in。"""
-        if not self.barge_in:
-            return False
         if self.tts.target == "speaker":
             print("⚠️  音箱播报模式下不支持打断（云端音频不受控），已自动关闭 --barge-in")
             return False
@@ -472,12 +630,22 @@ class Jarvis:
 
     def _run_wake_kws(self, path, once, gate: WakeGate, words: tuple[str, ...]) -> int:  # noqa: ANN001
         kws = KeywordWake(self.st.kws_model or KWS_DEFAULT_MODEL, list(words))
-        seg = Segmenter(self.vad_model, threshold=self.st.vad_threshold,
-                        min_silence=self.st.vad_silence_ms / 1000)
+        # 端点 Wi-Fi 抖动容易在句中挖空，静音门限加长减少半截切句
+        silence_ms = self.st.vad_silence_ms
+        if _is_endpoint(self.st.audio_source):
+            silence_ms = max(silence_ms, 800)
+        seg = Segmenter(
+            self.vad_model,
+            threshold=self.st.vad_threshold,
+            min_silence=silence_ms / 1000,
+        )
         print(f"\n唤醒词（KWS 专用模型）：{gate.words_hint()} · 唤醒后 {gate.follow_up_seconds:g}s 免唤醒")
+        if silence_ms != self.st.vad_silence_ms:
+            print(f"  VAD 静音门限 {silence_ms}ms（端点加长）", file=sys.stderr)
 
         def _take(utt, mic):  # noqa: ANN001
             text, ms = self.asr.transcribe(utt)
+            self._log_asr_utt(utt, text, ms)
             if not text.strip():
                 return False
             woke, cmd = gate.feed(text)
@@ -485,7 +653,7 @@ class Jarvis:
                 if woke:
                     self._announce_here()
                     if mic is not None:
-                        mic.drain()
+                        self._post_announce_listen(mic, seg)
                 return False
             print(f"  👤 {cmd}   ({ms:.0f}ms ASR)")
             if self._try_sleep(cmd, gate):
@@ -493,6 +661,11 @@ class Jarvis:
             gate.hold()  # 思考和播报期间窗口不倒计时
             try:
                 self.handle_text(cmd, mic=mic)
+                # 播报中被打断：立刻处理打断段，不要等下一轮 VAD
+                while self._pending:
+                    utt = self._pending.pop(0)
+                    print("\n[打断后续]")
+                    self.handle(utt, mic=mic)
                 if mic is not None and not self.interrupted:
                     mic.drain()
             finally:
@@ -511,8 +684,8 @@ class Jarvis:
                 chunk = pcm[i : i + 1024]
                 if not gate.awake and kws.feed(chunk):
                     gate.touch()
-                    print(f"  🟢 唤醒（KWS）")
-                    self._announce_here()
+                    print(f"  🟢 唤醒（KWS）· 等整句说完再识别")
+                    # 不立刻「我在」：同一句里的指令留给 VAD+ASR
                 for utt in seg.accept(chunk):
                     if gate.awake:
                         n += 1 if _take(utt, None) else 0
@@ -520,7 +693,6 @@ class Jarvis:
                         self._note_asleep()
             for _ in kws.flush():
                 gate.touch()
-                self._announce_here()
             tail = seg.flush()
             if tail is not None:
                 if gate.awake:
@@ -535,6 +707,12 @@ class Jarvis:
             try:
                 while True:
                     chunk = mic.read(timeout=0.5)
+                    if self.mic_muted:
+                        if gate.awake:
+                            gate.sleep()
+                        if was_awake:
+                            was_awake = False
+                        continue
                     if chunk is None:
                         if was_awake and not gate.awake:
                             self._led("idle")
@@ -545,9 +723,10 @@ class Jarvis:
                         if hit:
                             gate.touch()
                             was_awake = True
-                            print(f"  🟢 唤醒（KWS）「{hit}」")
-                            self._announce_here()
-                            mic.drain()
+                            print(f"  🟢 唤醒（KWS）「{hit}」· 等整句说完再识别")
+                            self._led("listen")
+                            # 不播「我在」、不 reset VAD：
+                            # 「小贾今天几号」要整句切完再 ASR，否则后半截被丢掉
                         elif was_awake:
                             self._led("idle")
                             was_awake = False
@@ -584,6 +763,10 @@ class Jarvis:
             gate.hold()
             try:
                 self.handle_text(cmd, mic=mic)
+                while self._pending:
+                    utt = self._pending.pop(0)
+                    print("\n[打断后续]")
+                    self.handle(utt, mic=mic)
                 if mic is not None and not self.interrupted:
                     mic.drain()
             finally:
@@ -614,6 +797,10 @@ class Jarvis:
             print("（Ctrl+C 退出）")
             while True:
                 chunk = mic.read(timeout=1.0)
+                if self.mic_muted:
+                    if gate.awake:
+                        gate.sleep()
+                    continue
                 if chunk is None:
                     continue
                 for utt in seg.accept(chunk):
@@ -651,15 +838,19 @@ def main(argv: list[str] | None = None) -> int:
         )
     app = Jarvis(st=st, use_fake_llm=args.fake_llm, speak=not args.no_speak)
     try:
+        app.barge_in = bool(args.barge_in)
+        if app.barge_in and not app._barge_in_supported():
+            app.barge_in = False
         if args.wake:
+            if app.barge_in:
+                print("打断：开（播报中可插话）", file=sys.stderr)
             return 0 if app.run_wake(args.wav, backend=args.wake_backend) else 1
         if args.wav:
             return 0 if app.run_wav(args.wav) else 1
-        app.barge_in = args.barge_in
         if args.ptt:
             app.run_ptt(once=args.once)
         else:
-            app.run_vad(once=args.once, barge_in=args.barge_in)
+            app.run_vad(once=args.once, barge_in=app.barge_in)
     except KeyboardInterrupt:
         print("\n再见")
     finally:

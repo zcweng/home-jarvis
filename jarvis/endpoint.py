@@ -227,6 +227,10 @@ class DownlinkWriter:
         v = int(round(max(-60.0, min(0.0, db)) + 60.0))
         return self._send(F_VOLUME, bytes([v & 0xFF]))
 
+    def volume_byte(self, v: int) -> bool:
+        """直接发 0–100 音量字节（设备端按 (v-60)/20 dB 解释）。"""
+        return self._send(F_VOLUME, bytes([max(0, min(100, int(v))) & 0xFF]))
+
     def ping(self) -> bool:
         return self._send(F_PING)
 
@@ -293,13 +297,16 @@ class EndpointMic:
             return np.zeros(0, dtype=np.float32)
         return np.concatenate(chunks)[:need]
 
-    def drain(self) -> None:
-        """丢掉积压。设备是连续推流，读空一小段时间即可。"""
+    def drain(self, seconds: float = 0.08) -> None:
+        """丢掉积压。设备是连续推流，读空一小段时间即可。
+
+        唤醒播「我在」后建议 0.3~0.5s，否则回声会进下一句 ASR。
+        """
         self._pending.clear()
-        t_end = _now() + 0.08
+        t_end = _now() + max(0.0, float(seconds))
         while _now() < t_end:
             cap = self.reader.read_capture(timeout=0.02)
-            if cap is None:
+            if cap is None and _now() >= t_end:
                 break
 
     @property
@@ -404,6 +411,9 @@ class EndpointSpeaker:
     @property
     def playing(self) -> bool:
         return self._thread is not None and self._thread.is_alive()
+
+    def set_volume_byte(self, v: int) -> bool:
+        return self.writer.volume_byte(v)
 
     def close(self) -> None:
         # 正常播完不要 FLUSH，让设备 ring 自行排空；只有打断才走 stop()

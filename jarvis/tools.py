@@ -348,6 +348,17 @@ class Tools:
             timeout=self.settings.web_search_timeout,
         )
 
+    # ---------------------------------------------------------------- 天气
+
+    def weather(self, city: str = "") -> str:
+        """中国气象局实况+近几日预报，返回可朗读短句。"""
+        from .weather import lookup
+
+        c = (city or "").strip() or (self.settings.weather_default_city or "").strip()
+        if not c:
+            return "请告诉我要查哪个城市。"
+        return lookup(c, timeout=self.settings.weather_timeout)
+
     # ---------------------------------------------------------------- 给 LLM 的 schema
 
     def schemas(self) -> list[dict[str, Any]]:
@@ -433,6 +444,30 @@ class Tools:
                 },
             },
         ]
+        if self.settings.weather_enabled:
+            default_city = (self.settings.weather_default_city or "成都").strip()
+            out.append(
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "weather",
+                        "description": (
+                            "查中国城市天气（中国气象局）：实况气温、风力湿度和近几日预报。"
+                            f"用户没说城市时用「{default_city}」。不要用 web_search 查天气。"
+                        ),
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "city": {
+                                    "type": "string",
+                                    "description": f"城市或区县名，例如「成都」「温江」；默认{default_city}",
+                                },
+                            },
+                            "required": [],
+                        },
+                    },
+                }
+            )
         if self.settings.web_search_enabled:
             out.append(
                 {
@@ -440,15 +475,16 @@ class Tools:
                     "function": {
                         "name": "web_search",
                         "description": (
-                            "联网搜索天气、新闻、营业时间、旅游攻略、价格行情等需要实时信息的问题。"
-                            "query 用完整中文问句。家电控制请用 control/query，不要用本工具。"
+                            "联网搜索新闻、营业时间、旅游攻略、价格行情等需要实时信息的问题。"
+                            "查天气请用 weather，不要用本工具。query 用完整中文问句。"
+                            "家电控制请用 control/query。"
                         ),
                         "parameters": {
                             "type": "object",
                             "properties": {
                                 "query": {
                                     "type": "string",
-                                    "description": "完整中文搜索问句，例如「成都今天天气」",
+                                    "description": "完整中文搜索问句，例如「青城山门票多少钱」",
                                 },
                             },
                             "required": ["query"],
@@ -466,11 +502,14 @@ class Tools:
             "scene": self.scene,
             "timer": self.timer,
             "web_search": self.web_search,
+            "weather": self.weather,
         }.get(name)
         if fn is None:
             return f"没有这个工具：{name}"
         if name == "web_search" and not self.settings.web_search_enabled:
             return "网页搜索未启用。"
+        if name == "weather" and not self.settings.weather_enabled:
+            return "天气查询未启用。"
         try:
             return str(fn(**args))
         except TypeError as e:

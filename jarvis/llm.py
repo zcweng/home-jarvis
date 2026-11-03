@@ -42,17 +42,33 @@ class LLMResult:
 
 
 class DeepSeek:
-    def __init__(self, settings: Settings | None = None, timeout: float = 30.0) -> None:
+    def __init__(self, settings: Settings | None = None, timeout: float | None = None) -> None:
         st = settings or Settings.load()
         if not st.deepseek_key:
             raise SystemExit("缺少 DEEPSEEK_KEY，填到 .env 里")
         self.model = st.llm_model
+        self.base_url = st.llm_base_url.rstrip("/")
+        self.timeout = float(st.llm_timeout if timeout is None else timeout)
+        self._key = st.deepseek_key
         self._client = httpx.Client(
-            base_url=st.llm_base_url.rstrip("/"),
-            headers={"Authorization": f"Bearer {st.deepseek_key}"},
-            timeout=timeout,
+            base_url=self.base_url,
+            headers={"Authorization": f"Bearer {self._key}"},
+            timeout=self.timeout,
         )
         self._thinking_param_ok = True
+
+    def key_hint(self) -> str:
+        """日志用：密钥前后各留 4 位，中间打码。"""
+        k = self._key or ""
+        if len(k) <= 8:
+            return "***"
+        return f"{k[:4]}…{k[-4:]}（len={len(k)}）"
+
+    def call_hint(self) -> str:
+        return (
+            f"model={self.model} base={self.base_url} "
+            f"timeout={self.timeout:g}s key={self.key_hint()}"
+        )
 
     # ------------------------------------------------------------------ 单次
 

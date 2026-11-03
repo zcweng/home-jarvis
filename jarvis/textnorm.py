@@ -1,15 +1,18 @@
-"""TTS 前的文本归一化：把阿拉伯数字读成中文。
+"""TTS 前的文本归一化：把阿拉伯数字、拉丁字母读成中文。
 
 为什么需要：本地神经 TTS（fanchen-C）的发音词典里只有汉字/拼音音素，
-`10` 这种阿拉伯数字是 **OOV**，sherpa-onnx 会静默丢掉它：
+`10` / `tiger` 这类是 **OOV**，sherpa-onnx 会静默丢掉它：
 
     sherpa-onnx ... Ignore OOV '10'
     "好，10秒后叫你。"  →  实际念成 "好，秒后叫你。"
+    Ignore OOV 'tiger'
+    "老虎英文是 tiger。" → 实际念成 "老虎英文是。"
 
-macOS `say` 和云端 TTS 会自己做数字展开，所以这层只需给本地神经 TTS 用；
+macOS `say` 和云端 TTS 会自己做数字/英文展开，所以这层主要给本地神经 TTS 用；
 但函数本身是通用的，别的地方想用也行。
 
-覆盖：整数、小数、百分比、时间、年月日、温度、长数字串（电话/编号）。
+覆盖：整数、小数、百分比、时间、年月日、温度、长数字串（电话/编号）、
+拉丁单词（常见词音译，其余按英文字母中文读名逐个念）。
 """
 
 from __future__ import annotations
@@ -95,15 +98,85 @@ _MONTH_DAY = re.compile(r"(\d{1,2})\s*([月日号])")
 _TEMP = re.compile(r"(\d+(?:\.\d+)?)\s*(?:℃|°C|摄氏度)")
 _CELSIUS = "摄氏度"
 _NUMBER = re.compile(r"\d+(?:\.\d+)?")
+_LATIN_WORD = re.compile(r"[A-Za-z]+(?:['’-][A-Za-z]+)*")
+
+# 英文字母中文读名（足够落在汉字词典里，避免 OOV）
+_LETTER_CN = {
+    "a": "诶",
+    "b": "比",
+    "c": "西",
+    "d": "迪",
+    "e": "伊",
+    "f": "艾弗",
+    "g": "吉",
+    "h": "艾尺",
+    "i": "艾",
+    "j": "杰",
+    "k": "开",
+    "l": "艾勒",
+    "m": "艾姆",
+    "n": "恩",
+    "o": "欧",
+    "p": "批",
+    "q": "吉优",
+    "r": "艾儿",
+    "s": "艾斯",
+    "t": "提",
+    "u": "优",
+    "v": "维",
+    "w": "达布刘",
+    "x": "艾克斯",
+    "y": "歪",
+    "z": "贼德",
+}
+
+# 常见词音译：比逐字母拼更像「怎么念」；不够再回落到字母读名
+_EN_WORD_CN = {
+    "tiger": "泰格",
+    "apple": "艾普尔",
+    "banana": "巴纳纳",
+    "hello": "哈喽",
+    "ok": "欧凯",
+    "okay": "欧凯",
+    "wifi": "歪法",
+    "ai": "诶艾",
+    "jarvis": "贾维斯",
+    "ios": "艾欧艾斯",
+    "iphone": "艾风",
+    "ipad": "艾派德",
+    "usb": "优艾斯比",
+    "cpu": "西批优",
+    "gps": "吉批艾斯",
+    "led": "艾勒伊迪",
+    "tv": "提维",
+}
+
+
+def _latin_to_cn(word: str) -> str:
+    key = re.sub(r"['’-]", "", word).lower()
+    if not key:
+        return word
+    if key in _EN_WORD_CN:
+        return _EN_WORD_CN[key]
+    # 缩写/短词：逐字母；较长未知词也逐字母（中文 TTS 无法真念英文）
+    return "".join(_LETTER_CN.get(ch, ch) for ch in key)
 
 
 def normalize_for_tts(text: str) -> str:
-    """把文本里会被 TTS 丢掉的阿拉伯数字换成中文读法。"""
+    """把文本里会被 TTS 丢掉的阿拉伯数字、拉丁词换成中文读法。"""
     if not text:
         return ""
     out = text.strip()
-    # 全角数字
+    # 全角数字 / 全角拉丁
     out = out.translate(str.maketrans("０１２３４５６７８９", "0123456789"))
+    out = out.translate(
+        str.maketrans(
+            "ＡＢＣＤＥＦＧＨＩＪＫＬＭＮＯＰＱＲＳＴＵＶＷＸＹＺ"
+            "ａｂｃｄｅｆｇｈｉｊｋｌｍｎｏｐｑｒｓｔｕｖｗｘｙｚ",
+            "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+            "abcdefghijklmnopqrstuvwxyz",
+        )
+    )
 
     # 顺序很重要：先处理复合语义（百分比/时间/年月日/温度），最后才处理裸数字
     out = _TEMP.sub(lambda m: _number_to_cn(m.group(1)) + _CELSIUS, out)
@@ -115,4 +188,5 @@ def normalize_for_tts(text: str) -> str:
     out = _YEAR.sub(lambda m: _digits_to_cn(m.group(1)) + "年", out)
     out = _MONTH_DAY.sub(lambda m: _number_to_cn(m.group(1)) + m.group(2), out)
     out = _NUMBER.sub(lambda m: _number_to_cn(m.group(0)), out)
+    out = _LATIN_WORD.sub(lambda m: _latin_to_cn(m.group(0)), out)
     return out

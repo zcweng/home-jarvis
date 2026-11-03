@@ -81,7 +81,7 @@ class SherpaTTS:
     # ---------------------------------------------------------------- 合成
 
     def synthesize(self, text: str) -> tuple[np.ndarray, int]:
-        # 这个模型的词典里没有阿拉伯数字，直接喂 "10" 会被静默丢掉（日志里是 Ignore OOV '10'）
+        # 词典只有汉字音素：阿拉伯数字/拉丁词会 Ignore OOV 静默丢掉，先归一化
         audio = self._tts.generate(normalize_for_tts(text), sid=self.sid, speed=self.speed)
         pcm = np.asarray(audio.samples, dtype=np.float32)
         return pcm, audio.sample_rate

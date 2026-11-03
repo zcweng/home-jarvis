@@ -4,10 +4,10 @@
 痛点：把提示只打在终端里，人容易漏看，测试就白跑。
 做法：屏幕上一个**常驻置顶的 HUD**，全程不变窗口、只变内容：
 
-    ① 提示 + 【开始】【跳过】按钮（同时"叮"一声）
-    ② 点开始 → 大字倒数 3-2-1（每档一声提示音）
-    ③ 采集中 → 红色边框 + 剩余秒数 + 进度条（这一段时间不出声，免得被麦克风拾取）
-    ④ 结束 → 绿色「✅ 完成」+ 三声"叮" + 系统通知
+    ① 提示 + 底部常驻【开始】【跳过】按钮（同时"叮"一声；按钮先占底，不会被文案挤出窗外）
+    ② 点开始 → 橙框 + 大字倒数 3-2-1（每档一声提示音）
+    ③ 采集中 → **鲜红粗边框** + 浅红底 + 剩余秒数 + 进度条（采集窗内不出提示音，免得被麦拾取）
+    ④ 结束 → 绿框「✅ 完成」+ 「叮」+ 系统通知
 
 用法：
 
@@ -58,8 +58,12 @@ C_HOLD_BG = "#fff4e5"
 C_HOLD_FG = "#8a4b00"
 C_REC_BG = "#fdecea"
 C_REC_FG = "#b3261e"
+C_REC_BORDER = "#e53935"  # 采集态真红框（别只靠浅红底，肉眼看不出「框」）
 C_DONE_BG = "#e7f6ec"
 C_DONE_FG = "#12643a"
+BORDER_IDLE = 0
+BORDER_HOLD = 6
+BORDER_REC = 14
 
 EXIT_OK = 0
 EXIT_UNCONFIRMED = 2
@@ -176,7 +180,12 @@ def _spoken(text: str) -> str:
 
 
 class Hud:
-    """一个常驻置顶窗口：提示 → 倒数 → 采集中 → 完成，只换内容不换窗口。"""
+    """一个常驻置顶窗口：提示 → 倒数 → 采集中 → 完成，只换内容不换窗口。
+
+    布局硬约束（踩过的坑）：
+    - 按钮行必须先 `side=bottom` 占位，否则多行文案 + f_big.expand 会把【开始】裁出窗外。
+    - 「红框」= root 外边框色带（padx/pady），不是浅红底——浅红底几乎看不出来。
+    """
 
     def __init__(self, title: str = DEFAULT_TITLE) -> None:
         import tkinter as tk  # noqa: PLC0415
@@ -190,37 +199,45 @@ class Hud:
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
         self._closed_by_user = False
         self._choice: str | None = None
+        self._border_w = BORDER_IDLE
+        self._mode = "prompt"  # prompt | hold | live | done
 
-        self.f_title = tk.Label(self.root, bg=C_IDLE_BG, fg="#6e6e73", font=("PingFang SC", 13))
-        self.f_title.pack(fill="x", padx=22, pady=(16, 0))
+        # 外框：采集态把 root 刷成鲜红，inner 缩进 → 真·红框
+        self.inner = tk.Frame(self.root, bg=C_IDLE_BG)
+        self.inner.pack(fill="both", expand=True, padx=0, pady=0)
 
-        self.f_head = tk.Label(
-            self.root, bg=C_IDLE_BG, fg=C_IDLE_FG, font=("PingFang SC", 24, "bold"),
-            wraplength=560, justify="center",
-        )
-        self.f_head.pack(fill="both", expand=True, padx=22, pady=(6, 4))
-
-        self.f_sub = tk.Label(
-            self.root, bg=C_IDLE_BG, fg=C_IDLE_FG, font=("PingFang SC", 15),
-            wraplength=560, justify="center",
-        )
-        self.f_sub.pack(fill="both", expand=True, padx=22, pady=(0, 6))
-
-        self.f_big = tk.Label(self.root, bg=C_IDLE_BG, fg=C_IDLE_FG, font=("PingFang SC", 96, "bold"))
-        self.f_big.pack(fill="both", expand=True)
-
-        self.bar = tk.Canvas(self.root, height=10, bg=C_IDLE_BG, highlightthickness=0)
-        self.bar.pack(fill="x", padx=26, pady=(0, 8))
-        self._bar_bg = self.bar.create_rectangle(0, 0, 0, 10, fill="#d9d9de", outline="")
-
-        self.btn_row = tk.Frame(self.root, bg=C_IDLE_BG)
-        self.btn_row.pack(fill="x", padx=22, pady=(0, 18))
+        # 底部控件先 pack，保证永远可见
+        self.btn_row = tk.Frame(self.inner, bg=C_IDLE_BG)
+        self.btn_row.pack(side="bottom", fill="x", padx=22, pady=(8, 18))
         self._buttons: dict[str, Any] = {}
 
-        self.root.withdraw()
-        self._geometry(560, 320)
+        self.bar = tk.Canvas(self.inner, height=10, bg=C_IDLE_BG, highlightthickness=0)
+        self.bar.pack(side="bottom", fill="x", padx=26, pady=(0, 4))
+        self._bar_bg = self.bar.create_rectangle(0, 0, 0, 10, fill="#d9d9de", outline="")
 
-    # 窗口定位：屏幕上方居中偏右，不挡脸也不挡终端
+        self.f_title = tk.Label(self.inner, bg=C_IDLE_BG, fg="#6e6e73", font=("PingFang SC", 13))
+        self.f_title.pack(side="top", fill="x", padx=22, pady=(16, 0))
+
+        self.f_head = tk.Label(
+            self.inner, bg=C_IDLE_BG, fg=C_IDLE_FG, font=("PingFang SC", 22, "bold"),
+            wraplength=500, justify="center",
+        )
+        self.f_head.pack(side="top", fill="x", padx=22, pady=(8, 4))
+
+        self.f_sub = tk.Label(
+            self.inner, bg=C_IDLE_BG, fg=C_IDLE_FG, font=("PingFang SC", 15),
+            wraplength=500, justify="center",
+        )
+        self.f_sub.pack(side="top", fill="x", padx=22, pady=(0, 6))
+
+        self.f_big = tk.Label(self.inner, bg=C_IDLE_BG, fg=C_IDLE_FG, font=("PingFang SC", 96, "bold"))
+        # 提示态不占位；倒数/采集再 pack
+        self._big_packed = False
+
+        self.root.withdraw()
+        self._geometry(560, 420)
+
+    # 窗口定位：屏幕上方居中，不挡脸也不挡终端
     def _geometry(self, w: int, h: int) -> None:
         sw = self.root.winfo_screenwidth()
         x = max(20, (sw - w) // 2)
@@ -230,12 +247,28 @@ class Hud:
         self._closed_by_user = True
         self.root.withdraw()
 
-    def _paint(self, bg: str, fg: str) -> None:
-        for w in (self.root, self.f_title, self.f_head, self.f_sub, self.f_big, self.bar, self.btn_row):
+    def _set_border(self, width: int, color: str) -> None:
+        """root 底色 + inner 缩进 = 可见色框。width=0 无框。"""
+        self._border_w = width
+        self.root.configure(bg=color if width else C_IDLE_BG)
+        self.inner.pack_configure(padx=width, pady=width)
+
+    def _paint(self, bg: str, fg: str, *, border_w: int = BORDER_IDLE, border_color: str = C_IDLE_BG) -> None:
+        self._set_border(border_w, border_color)
+        for w in (self.inner, self.f_title, self.f_head, self.f_sub, self.f_big, self.bar, self.btn_row):
             w.configure(bg=bg)
+        self.f_title.configure(fg="#6e6e73" if border_w == 0 else fg)
         self.f_head.configure(fg=fg)
         self.f_sub.configure(fg=fg)
         self.f_big.configure(bg=bg, fg=fg)
+
+    def _pack_big(self, on: bool) -> None:
+        if on and not self._big_packed:
+            self.f_big.pack(side="top", fill="both", expand=True, pady=(4, 4))
+            self._big_packed = True
+        elif not on and self._big_packed:
+            self.f_big.pack_forget()
+            self._big_packed = False
 
     def _clear_buttons(self) -> None:
         for b in self._buttons.values():
@@ -246,15 +279,17 @@ class Hud:
         self._clear_buttons()
         for i, label in enumerate(labels):
             btn = self.tk.Button(
-                self.btn_row, text=label, font=("PingFang SC", 15),
-                width=10, relief="flat", bd=0, cursor="hand2",
+                self.btn_row, text=label, font=("PingFang SC", 16, "bold"),
+                width=12, relief="raised", bd=2, cursor="hand2",
                 bg="#ffffff" if i else "#0a84ff",
                 fg="#1d1d1f" if i else "#ffffff",
                 activebackground="#e8e8ed" if i else "#0070e0",
                 activeforeground="#1d1d1f" if i else "#ffffff",
+                highlightthickness=1,
+                highlightbackground="#0a84ff" if not i else "#c7c7cc",
                 command=lambda lb=label: self._click(lb),
             )
-            btn.pack(side="left", expand=True, padx=6, ipady=8)
+            btn.pack(side="left", expand=True, padx=8, ipady=10)
             self._buttons[label] = btn
 
     def _click(self, label: str) -> None:
@@ -265,11 +300,14 @@ class Hud:
         frac = max(0.0, min(1.0, frac))
         w = max(1, self.bar.winfo_width() or 1)
         self.bar.coords(self._bar_bg, 0, 0, int(w * frac), 10)
+        # 采集态进度条用红，其它灰
+        self.bar.itemconfigure(self._bar_bg, fill=C_REC_BORDER if self._mode == "live" else "#d9d9de")
 
-    def _show(self, big_height: bool) -> None:
+    def _show(self, *, height: int) -> None:
         """让窗口真的到前台（macOS 上 lift+topmost+focus 三连）。"""
-        h = 380 if big_height else 300
-        self._geometry(560, h)
+        # 外框加宽后窗口总像素要跟着加，否则内容被挤
+        bw = self._border_w
+        self._geometry(560 + 2 * bw, height + 2 * bw)
         self.root.deiconify()
         self.root.lift()
         self.root.attributes("-topmost", True)
@@ -303,16 +341,19 @@ class Hud:
         lines = [ln for ln in text.strip().splitlines() if ln.strip()]
         head = lines[0] if lines else "请按提示操作"
         sub = "\n".join(lines[1:])
-        self._paint(C_IDLE_BG, C_IDLE_FG)
+        self._mode = "prompt"
+        self._paint(C_IDLE_BG, C_IDLE_FG, border_w=BORDER_IDLE)
         self.f_title.configure(text=f"● {title}")
         self.f_head.configure(text=head)
         self.f_sub.configure(text=sub)
         self.f_big.configure(text="")
+        self._pack_big(False)
         self._bar_set(0)
-        self._close_btn_missing = False
         self._populate_buttons(buttons)
         self._choice = None
-        self._show(big_height=False)
+        # 多行提示需要更高窗口，按钮永远在底
+        n_lines = 1 + sub.count("\n") + (1 if sub else 0)
+        self._show(height=max(420, 280 + n_lines * 28))
 
         end = time.monotonic() + timeout
         auto = _autoclick_ms()
@@ -330,14 +371,16 @@ class Hud:
         return self._choice
 
     def hold(self, seconds: int) -> None:
-        """倒数阶段：大字 3-2-1，每档"叮"一声。"""
-        self._paint(C_HOLD_BG, C_HOLD_FG)
+        """倒数阶段：大字 3-2-1，每档"叮"一声；橙框提示「快开始了」。"""
+        self._mode = "hold"
+        self._paint(C_HOLD_BG, C_HOLD_FG, border_w=BORDER_HOLD, border_color="#f5a623")
         self.f_title.configure(text="● 准备开始")
         self.f_head.configure(text="马上开始，请就位")
         self.f_sub.configure(text="")
         self._clear_buttons()
+        self._pack_big(True)
         self._bar_set(0)
-        self._show(big_height=True)
+        self._show(height=440)
         for n in range(seconds, 0, -1):
             self.f_big.configure(text=str(n))
             self.root.update()
@@ -345,29 +388,32 @@ class Hud:
             self._pump(1.0)
 
     def live(self, headline: str, sub: str, seconds: float | None) -> None:
-        """切到「采集中」红态。seconds=None 只摆好 UI，由调用方继续泵；有秒数则自己倒数。"""
-        self._paint(C_REC_BG, C_REC_FG)
-        self.f_title.configure(text="● 采集中 · 请保持动作")
+        """切到「采集中」红框态。seconds=None 只摆好 UI，由调用方继续泵；有秒数则自己倒数。"""
+        self._mode = "live"
+        self._paint(C_REC_BG, C_REC_FG, border_w=BORDER_REC, border_color=C_REC_BORDER)
+        self.f_title.configure(text="● 采集中 · 红框亮起时请说话")
         self.f_head.configure(text=headline)
         self.f_sub.configure(text=sub)
         self._clear_buttons()
+        self._pack_big(True)
         self.f_big.configure(text="")
         self._bar_set(0)
-        self._show(big_height=True)
+        self._show(height=460)
 
         if seconds is None:
-            # 不定时长：只建好红态，调用方边跑边 update
             return
         self.countdown_capture(seconds, headline, sub)
 
     def countdown_capture(self, seconds: float, headline: str, sub: str) -> None:
-        """确定时长采集：大字倒计时 + 进度条 + 每秒闪一下。"""
-        self._paint(C_REC_BG, C_REC_FG)
-        self.f_title.configure(text="● 采集中 · 请保持动作")
+        """确定时长采集：大红框 + 大字倒计时 + 进度条。"""
+        self._mode = "live"
+        self._paint(C_REC_BG, C_REC_FG, border_w=BORDER_REC, border_color=C_REC_BORDER)
+        self.f_title.configure(text="● 采集中 · 红框亮起时请说话")
         self.f_head.configure(text=headline)
         self.f_sub.configure(text=sub)
         self._clear_buttons()
-        self._show(big_height=True)
+        self._pack_big(True)
+        self._show(height=460)
 
         start = time.monotonic()
         last_int = None
@@ -380,22 +426,25 @@ class Hud:
             if shown != last_int:
                 last_int = shown
                 self.f_big.configure(text=str(shown) if shown > 0 else "✓")
-                # 剩下 3 秒内每秒闪一下底色，眼睛余光也能看见
                 if shown <= 3 and shown > 0:
-                    self._paint(C_REC_BG, C_REC_FG)
+                    # 末 3 秒边框闪深/浅红，余光也能看见
+                    flash = C_REC_BORDER if shown % 2 else "#ff8a80"
+                    self._set_border(BORDER_REC, flash)
             if left <= 0:
                 break
             time.sleep(0.04)
 
     def done(self, sub: str = "", *, dwell: float = 2.0) -> None:
-        self._paint(C_DONE_BG, C_DONE_FG)
+        self._mode = "done"
+        self._paint(C_DONE_BG, C_DONE_FG, border_w=BORDER_HOLD, border_color="#34c759")
         self.f_title.configure(text="● 完成")
         self.f_head.configure(text="✅ 这一段结束了")
         self.f_sub.configure(text=sub)
         self.f_big.configure(text="")
+        self._pack_big(False)
         self._bar_set(1.0)
         self._clear_buttons()
-        self._show(big_height=False)
+        self._show(height=320)
         self._pump(dwell)
         self.root.withdraw()
 

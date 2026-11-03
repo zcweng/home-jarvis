@@ -71,6 +71,8 @@ class FakeLLM:
         matched = next((s for s in self.script if s[0] in user), None)
         if matched is None and force_tool == "control":
             matched = ("", "control", {"device": "@last", "action": "toggle"}, "好的。")
+        if matched is None and force_tool == "web_search":
+            matched = ("", "web_search", {"query": user}, "")
 
         if matched is None:
             res.text = "我在。"

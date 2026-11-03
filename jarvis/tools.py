@@ -333,11 +333,25 @@ class Tools:
             return 100 if st.get("state") == "on" else 0
         return round(b / 255 * 100)
 
+    # ---------------------------------------------------------------- 网页搜索
+
+    def web_search(self, query: str) -> str:
+        """百度搜索，返回可念的短摘要素材。"""
+        from .web_search import search as baidu_search
+
+        q = (query or "").strip()
+        if not q:
+            return "搜索词为空。"
+        return baidu_search(
+            q,
+            count=self.settings.web_search_count,
+            timeout=self.settings.web_search_timeout,
+        )
+
     # ---------------------------------------------------------------- 给 LLM 的 schema
 
-    @staticmethod
-    def schemas() -> list[dict[str, Any]]:
-        return [
+    def schemas(self) -> list[dict[str, Any]]:
+        out: list[dict[str, Any]] = [
             {
                 "type": "function",
                 "function": {
@@ -419,6 +433,30 @@ class Tools:
                 },
             },
         ]
+        if self.settings.web_search_enabled:
+            out.append(
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "web_search",
+                        "description": (
+                            "联网搜索天气、新闻、营业时间、旅游攻略、价格行情等需要实时信息的问题。"
+                            "query 用完整中文问句。家电控制请用 control/query，不要用本工具。"
+                        ),
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "query": {
+                                    "type": "string",
+                                    "description": "完整中文搜索问句，例如「成都今天天气」",
+                                },
+                            },
+                            "required": ["query"],
+                        },
+                    },
+                }
+            )
+        return out
 
     def dispatch(self, name: str, args: dict[str, Any]) -> str:
         fn = {
@@ -427,9 +465,12 @@ class Tools:
             "announce": self.announce,
             "scene": self.scene,
             "timer": self.timer,
+            "web_search": self.web_search,
         }.get(name)
         if fn is None:
             return f"没有这个工具：{name}"
+        if name == "web_search" and not self.settings.web_search_enabled:
+            return "网页搜索未启用。"
         try:
             return str(fn(**args))
         except TypeError as e:

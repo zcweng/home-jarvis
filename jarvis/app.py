@@ -38,7 +38,7 @@ from .endpoint import (
     parse_endpoint,
 )
 from .ha import HAClient
-from .intent import looks_like_command
+from .intent import looks_like_command, looks_like_web_search
 from .llm import DeepSeek
 from .output import SpeechRouter
 from .session import Session
@@ -46,22 +46,41 @@ from .tools import Tools
 from .vad import Segmenter
 from .kws import DEFAULT_MODEL as KWS_DEFAULT_MODEL
 from .kws import KeywordWake
+from .s12_led import NullLed, S12Led
 from .wake import WakeGate, is_sleep_request
 
 
-def chat_with_guard(llm, messages, schemas, dispatch, user_text, on_retry=None, on_tool_calls=None):
-    """调用模型；若"看起来是命令但一个工具都没调"，强制重问一次。
+def chat_with_guard(
+    llm,
+    messages,
+    schemas,
+    dispatch,
+    user_text,
+    on_retry=None,
+    on_tool_calls=None,
+    *,
+    web_search_enabled: bool = False,
+):
+    """调用模型；命令未调工具 / 联网问句未搜索时，强制重问一次。
 
     实测模型会凭上下文说"客厅灯已经关了"，却一次没调 control —— 灯根本没动。
-    prompt 堵不住这类幻觉，只能靠编排层兜底。
+    也会直接说「没接天气」而不调 web_search。prompt 堵不住，编排层兜底。
     """
     res = llm.chat(messages, schemas, dispatch=dispatch, on_tool_calls=on_tool_calls)
-    if res.tool_calls or not looks_like_command(user_text):
+    if res.tool_calls:
+        return res
+    force: str | None = None
+    if looks_like_command(user_text):
+        force = "control"
+    elif web_search_enabled and looks_like_web_search(user_text):
+        force = "web_search"
+    if not force:
         return res
     if on_retry:
         on_retry()
-    retry = llm.chat(messages, schemas, dispatch=dispatch, force_tool="control",
-                     on_tool_calls=on_tool_calls)
+    retry = llm.chat(
+        messages, schemas, dispatch=dispatch, force_tool=force, on_tool_calls=on_tool_calls
+    )
     retry.forced = True
     return retry
 
@@ -98,6 +117,7 @@ class Jarvis:
         self.interrupted = False
         self._asleep_notice_at = 0.0
         self._mic_factory, self._speaker, router_st, audio_label = self._build_audio()
+        self.led = self._build_led()
         print("加载模型…", file=sys.stderr)
         t0 = time.perf_counter()
         self.asr = SenseVoice(self.st.asr_model_dir, language=self.st.asr_language)
@@ -122,11 +142,13 @@ class Jarvis:
         else:
             self.llm = DeepSeek(self.st)
         self.session = Session.load(self.tools.catalog())
+        self._here_phrase = "我在"
+        self._awake_announced_at = 0.0
         if speak and self._ack_phrases:
             if self.tts.target == "speaker":
                 print("音箱播报模式：跳过「首句先出声」（云端 TTS 无法预渲染）", file=sys.stderr)
             else:
-                n = self.tts.warm(self._ack_phrases + [self.st.sleep_reply])
+                n = self.tts.warm(self._ack_phrases + [self.st.sleep_reply, self._here_phrase])
                 if n:
                     print(f"预渲染应答短语 {n} 条（首句可 0ms 出声）", file=sys.stderr)
         if self.tts.target in ("speaker", "both"):
@@ -161,7 +183,44 @@ class Jarvis:
         speaker = Speaker(self.st.output_device) if self.st.tts_mode == "wav" else None
         return factory, speaker, self.st, f"local:{self.st.input_device or 'default'}"
 
+    def _build_led(self):
+        """端点模式且 LED_ENABLED 时接 S12 灯环；否则空操作。"""
+        if not (_is_endpoint(self.st.audio_source) and self.st.led_enabled):
+            return NullLed()
+        host, _ = parse_endpoint(self.st.speaker_endpoint)
+        led = S12Led(host, self.st.led_port, enabled=True)
+        led.set("idle")
+        print(
+            f"灯环：{host}:{self.st.led_port}（待命熄灭 / 聆听绿 / 思考蓝呼吸 / 播报蓝 / 出错红）",
+            file=sys.stderr,
+        )
+        return led
+
+    def _led(self, state: str) -> None:
+        try:
+            self.led.set(state)  # type: ignore[arg-type]
+        except Exception as e:  # noqa: BLE001
+            print(f"⚠️  灯环 {state}：{e}", file=sys.stderr)
+
     # ------------------------------------------------------------------ 一轮
+
+    def _announce_here(self) -> None:
+        """唤醒后回一声「我在」（2s 内不重复，避免 KWS + 空指令各说一次）。"""
+        now = time.monotonic()
+        if now - self._awake_announced_at < 2.0:
+            return
+        self._awake_announced_at = now
+        print("  🟢 我在，说吧")
+        if not self.speak_enabled:
+            self._led("listen")
+            return
+        if self.tts.target == "speaker":
+            self._led("listen")
+            return
+        # 端点下行与终答共用一条 TCP：短句必须阻塞播完，避免与下一句抢锁
+        self._led("speak")
+        self.tts.play_cached(self._here_phrase, blocking=True)
+        self._led("listen")
 
     def _early_ack(self, calls) -> None:  # noqa: ANN001
         """工具刚决定、还没执行时先播一个短应答，掩盖第二轮的 600ms。"""
@@ -170,13 +229,14 @@ class Jarvis:
         if self.tts.target == "speaker":
             # 云端 TTS 没法预渲染，硬插一句"好的"只会让两句话更慢更乱
             return
-        if _is_endpoint(self.st.audio_source):
-            # 下行单 TCP：非阻塞「好的」会和终答抢同一把 socket 锁，直接死锁
-            return
         phrase = self._ack_phrases[self._ack_idx % len(self._ack_phrases)]
         self._ack_idx += 1
-        ms = self.tts.play_cached(phrase)
+        # 端点模式用阻塞播：非阻塞会与终答抢 DownlinkWriter 锁导致死锁
+        blocking = _is_endpoint(self.st.audio_source)
+        self._led("speak")
+        ms = self.tts.play_cached(phrase, blocking=blocking)
         print(f"  ⚡ 先出声「{phrase}」({ms:.1f}ms)")
+        self._led("think")
 
     def handle(self, pcm: np.ndarray, mic: Mic | None = None) -> str:
         """一段音频 → 一句回答（同时朗读）。返回回答文本。"""
@@ -195,12 +255,25 @@ class Jarvis:
 
     def handle_text(self, text: str, mic: Mic | None = None) -> str:
         """已经拿到文本时直接进思考+说话（唤醒门控走这条路，避免二次 ASR）。"""
-        msgs = self.session.messages(text)
-        res = chat_with_guard(
-            self.llm, msgs, Tools.schemas(), self._dispatch, text,
-            on_retry=lambda: print("  ⚠️  看起来是命令但没调用工具，强制重问一次"),
-            on_tool_calls=self._early_ack,
-        )
+        self._led("think")
+        try:
+            msgs = self.session.messages(text)
+            schemas = self.tools.schemas()
+            res = chat_with_guard(
+                self.llm,
+                msgs,
+                schemas,
+                self._dispatch,
+                text,
+                on_retry=lambda: print("  ⚠️  未调工具，强制重问一次"),
+                on_tool_calls=self._early_ack,
+                web_search_enabled=self.st.web_search_enabled,
+            )
+        except Exception:
+            self._led("error")
+            time.sleep(1.2)
+            self._led("listen")
+            raise
 
         reply = res.text or (res.tool_results[-1][1] if res.tool_results else "")
         if not reply:
@@ -215,6 +288,7 @@ class Jarvis:
         if self.speak_enabled:
             self.tts.wait_idle()  # 先出声的"好的"还没播完就先等等，别两句叠在一起
             t1 = time.perf_counter()
+            self._led("speak")
             if mic is not None and self.barge_in:
                 self._speak_barge_in(reply, mic)
             else:
@@ -224,6 +298,7 @@ class Jarvis:
             # 下一轮会把喇叭回声当成用户说话（VAD 说是"有声"，其实是自己）
             if mic is not None and not self.interrupted:
                 mic.drain()
+        self._led("listen")
         return reply
 
     def _speak_barge_in(self, text: str, mic: Mic) -> None:
@@ -272,10 +347,12 @@ class Jarvis:
         def _speak() -> None:
             print(f"  🤖 {reply}")
             if self.speak_enabled:
+                self._led("speak")
                 self.tts.speak(reply)
 
         done = handle_sleep(cmd, gate, words, _speak)
         if done:
+            self._led("idle")
             print("  🌙 已退出连续对话，需要重新喊唤醒词")
         return done
 
@@ -406,7 +483,9 @@ class Jarvis:
             woke, cmd = gate.feed(text)
             if not woke or len(cmd) < 2:
                 if woke:
-                    print("  🟢 我在，说吧")
+                    self._announce_here()
+                    if mic is not None:
+                        mic.drain()
                 return False
             print(f"  👤 {cmd}   ({ms:.0f}ms ASR)")
             if self._try_sleep(cmd, gate):
@@ -432,7 +511,8 @@ class Jarvis:
                 chunk = pcm[i : i + 1024]
                 if not gate.awake and kws.feed(chunk):
                     gate.touch()
-                    print("  🟢 唤醒（KWS）")
+                    print(f"  🟢 唤醒（KWS）")
+                    self._announce_here()
                 for utt in seg.accept(chunk):
                     if gate.awake:
                         n += 1 if _take(utt, None) else 0
@@ -440,6 +520,7 @@ class Jarvis:
                         self._note_asleep()
             for _ in kws.flush():
                 gate.touch()
+                self._announce_here()
             tail = seg.flush()
             if tail is not None:
                 if gate.awake:
@@ -450,21 +531,36 @@ class Jarvis:
 
         with self._mic_factory() as mic:
             print("（Ctrl+C 退出）")
-            while True:
-                chunk = mic.read(timeout=0.5)
-                if chunk is None:
-                    continue
-                if not gate.awake:
-                    hit = kws.feed(chunk)
-                    if hit:
-                        gate.touch()
-                        print(f"  🟢 唤醒（KWS）「{hit}」")
-                for utt in seg.accept(chunk):
-                    if not gate.awake:
-                        self._note_asleep()
+            was_awake = False
+            try:
+                while True:
+                    chunk = mic.read(timeout=0.5)
+                    if chunk is None:
+                        if was_awake and not gate.awake:
+                            self._led("idle")
+                            was_awake = False
                         continue
-                    if _take(utt, mic) and once:
-                        return 1
+                    if not gate.awake:
+                        hit = kws.feed(chunk)
+                        if hit:
+                            gate.touch()
+                            was_awake = True
+                            print(f"  🟢 唤醒（KWS）「{hit}」")
+                            self._announce_here()
+                            mic.drain()
+                        elif was_awake:
+                            self._led("idle")
+                            was_awake = False
+                    else:
+                        was_awake = True
+                    for utt in seg.accept(chunk):
+                        if not gate.awake:
+                            self._note_asleep()
+                            continue
+                        if _take(utt, mic) and once:
+                            return 1
+            finally:
+                self._led("idle")
         return 0
 
     def _run_wake_asr(self, path, once, gate: WakeGate, words: tuple[str, ...]) -> int:  # noqa: ANN001
@@ -480,7 +576,7 @@ class Jarvis:
                 print(f"  💤 未唤醒，忽略：{text}")
                 return False
             if len(cmd) < 2:
-                print("  🟢 我在，说吧")
+                self._announce_here()
                 return False
             print(f"  👤 {cmd}   ({ms:.0f}ms ASR · 唤醒词已剥离)")
             if self._try_sleep(cmd, gate):

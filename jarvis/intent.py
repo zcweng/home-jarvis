@@ -40,3 +40,22 @@ def looks_like_command(text: str) -> bool:
 def looks_like_state_question(text: str) -> bool:
     t = (text or "").strip()
     return bool(_QUESTION.search(t) or re.search(r"(开着|关着|状态|几度)", t))
+
+
+# 需要联网的时效/外部事实（宁可多判；误判只会多一次搜索）
+_WEB = re.compile(
+    r"(天气|气温|下雨|下雪|预报|新闻|头条|热搜|股价|汇率|比分|"
+    r"几点|营业|门票|攻略|好玩|怎么走|多少钱|最新|今天|明天|昨天|"
+    r"查一下|搜一下|网上|百度|百科|谁是|哪年|发生了什么)"
+)
+
+
+def looks_like_web_search(text: str) -> bool:
+    """是否像需要联网搜索的问句（用于未调 web_search 时强制重问）。"""
+    t = (text or "").strip()
+    if not t:
+        return False
+    # 家电控制优先走 control，不抢成搜索
+    if looks_like_command(t):
+        return False
+    return _WEB.search(t) is not None

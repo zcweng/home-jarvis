@@ -54,7 +54,7 @@ def main() -> int:
     def turn(text: str):
         msgs = session.messages(text)
         t0 = time.perf_counter()
-        res = llm.chat(msgs, Tools.schemas(), dispatch=dispatch)
+        res = llm.chat(msgs, tools.schemas(), dispatch=dispatch)
         session.add_user(text)
         session.add_assistant(res.text)
         print(f"   耗时 {res.latency_ms:.0f}ms · 轮次 {res.rounds} · 工具调用 "

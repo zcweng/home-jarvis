@@ -68,6 +68,9 @@ class Settings:
     audio_source: str = "local"
     speaker_endpoint: str = "192.168.1.3"  # host 或 tcp://host:8765（上行）
     speaker_down_port: int = 8766          # 下行 PCM 端口
+    # S12 灯环（设备端 tools/s12led/ledd.sh，UDP）
+    led_enabled: bool = True
+    led_port: int = 8767
     # ASR
     asr_model_dir: str = "models/sensevoice"
     asr_language: str = "zh"
@@ -87,7 +90,7 @@ class Settings:
     # 唤醒
     wake_words: str = "贾维斯|小贾|管家"
     wake_backend: str = "kws"
-    sleep_words: str = "退下吧|退下|退出|退出对话|结束|结束对话|再见|拜拜|不聊了|没事了|休息吧|你去忙吧"
+    sleep_words: str = "退下吧|退下|退一下吧|退出|退出对话|结束|结束对话|再见|拜拜|不聊了|没事了|休息吧|你去忙吧"
     sleep_reply: str = "好，有事叫我。"
     kws_model: str = "models/sherpa-onnx-kws-zipformer-wenetspeech-3.3M-2024-01-01"
     # 打断与首句
@@ -101,6 +104,10 @@ class Settings:
     announce_max_chars: int = 80       # 单条文本上限，超了按句切分
     # 会话
     follow_up_seconds: float = 8.0
+    # 网页搜索（百度 SERP 抓取，无 API key）
+    web_search_enabled: bool = False
+    web_search_count: int = 5
+    web_search_timeout: float = 5.0
 
     @classmethod
     def load(cls) -> Settings:
@@ -116,6 +123,8 @@ class Settings:
             audio_source=_env("AUDIO_SOURCE", cls.audio_source),
             speaker_endpoint=_env("SPEAKER_ENDPOINT", cls.speaker_endpoint),
             speaker_down_port=_env_int("SPEAKER_DOWN_PORT", cls.speaker_down_port),
+            led_enabled=_env("LED_ENABLED", "true").lower() in ("1", "true", "yes"),
+            led_port=_env_int("LED_PORT", cls.led_port),
             asr_model_dir=_env("ASR_MODEL_DIR", cls.asr_model_dir),
             asr_language=_env("ASR_LANGUAGE", cls.asr_language),
             tts_backend=_env("TTS_BACKEND", cls.tts_backend),
@@ -141,6 +150,9 @@ class Settings:
             announce_entity=_env("ANNOUNCE_ENTITY", cls.announce_entity),
             announce_max_chars=_env_int("ANNOUNCE_MAX_CHARS", cls.announce_max_chars),
             follow_up_seconds=_env_float("FOLLOW_UP_SECONDS", cls.follow_up_seconds),
+            web_search_enabled=_env("WEB_SEARCH_ENABLED", "false").lower() in ("1", "true", "yes"),
+            web_search_count=_env_int("WEB_SEARCH_COUNT", cls.web_search_count),
+            web_search_timeout=_env_float("WEB_SEARCH_TIMEOUT", cls.web_search_timeout),
         )
 
     def require_ha(self) -> None:

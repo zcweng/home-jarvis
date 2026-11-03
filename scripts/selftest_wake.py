@@ -85,7 +85,7 @@ def main() -> int:
     from jarvis.app import handle_sleep
     from jarvis.wake import DEFAULT_SLEEP_WORDS, is_sleep_request
 
-    for text, expect in [("退下吧", True), ("退出", True), ("结束对话", True), ("再见", True),
+    for text, expect in [("退下吧", True), ("退一下吧", True), ("退出", True), ("结束对话", True), ("再见", True),
                          ("好的，退下吧", True), ("把空调退出节能模式", False), ("客厅灯关掉", False)]:
         check(f"收线判定：{text}", is_sleep_request(text) == expect)
 

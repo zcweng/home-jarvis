@@ -22,7 +22,7 @@ DEFAULT_WORDS = ("贾维斯", "小贾", "管家", "小智")
 
 # 退出词：说完立刻关掉连续对话窗口，下次必须重新喊唤醒词
 DEFAULT_SLEEP_WORDS = (
-    "退下吧", "退下", "退下吧你", "退出", "退出对话", "结束", "结束对话",
+    "退下吧", "退下", "退下吧你", "退一下吧", "退出", "退出对话", "结束", "结束对话",
     "再见", "拜拜", "不聊了", "没事了", "休息吧", "你去忙吧",
 )
 
@@ -76,6 +76,8 @@ def is_sleep_request(text: str, words: tuple[str, ...] = DEFAULT_SLEEP_WORDS) ->
     t = _clean(text)
     if not t:
         return False
+    # ASR 常把「退下吧」听成「退一下吧」（多了个「一」）
+    t = t.replace("退一下", "退下")
     changed = True
     while changed:
         changed = False
@@ -90,7 +92,14 @@ def is_sleep_request(text: str, words: tuple[str, ...] = DEFAULT_SLEEP_WORDS) ->
     if t in words:
         return True
     # ASR 偶尔多出一个字（"退下吧你"），短句允许一次前缀包含
-    return any(t.startswith(w) and len(t) - len(w) <= 2 for w in words)
+    if any(t.startswith(w) and len(t) - len(w) <= 2 for w in words):
+        return True
+    # 整句很短时允许 1 字听错（「退下吧」↔「退夏吧」），长句不放开以免误触
+    if len(t) <= 6:
+        for w in words:
+            if len(w) >= 2 and _fuzzy_index(t, w) is not None and abs(len(t) - len(w)) <= 2:
+                return True
+    return False
 
 
 @dataclass

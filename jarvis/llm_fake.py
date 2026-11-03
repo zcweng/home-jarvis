@@ -58,6 +58,7 @@ class FakeLLM:
         max_rounds: int = 3,
         temperature: float = 0.3,
         force_tool: str | None = None,
+        on_tool_calls=None,
     ) -> LLMResult:
         self.calls += 1
         user = ""
@@ -82,6 +83,11 @@ class FakeLLM:
 
         call = ToolCall(id=f"fake_{self.calls}", name=name, arguments=args)
         res.tool_calls.append(call)
+        if on_tool_calls is not None:
+            try:
+                on_tool_calls([call])
+            except Exception:  # noqa: BLE001
+                pass
         if dispatch is not None:
             out = dispatch(name, args)
             res.tool_results.append((name, out))

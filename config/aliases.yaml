@@ -1,0 +1,63 @@
+# 设备别名表：中文口语 → Home Assistant entity_id
+# 由 scripts/gen_aliases.py 生成，可随意手改；重跑只追加，不会覆盖你的改动（--rebuild 除外）
+#
+# 只放「家人真的会说出口」的设备。别名表越长，模型选错的概率越高。
+晾衣架:
+  entity: cover.hyd_cn_333346645_znlyj1_s_2_airer
+  type: cover
+  aliases: [晾衣架 晾衣架]
+
+空调:
+  entity: climate.zhimi_cn_116499975_za1
+  type: climate
+  aliases: [空调 空调]
+
+智能插座:
+  entity: switch.chuangmi_cn_234450788_m3_on_p_2_1
+  type: switch
+  aliases: [小米米家智能插座WiFi版 开关 开关]
+
+客厅的小米电视:
+  entity: media_player.xiaomi_cn_mitv_8524f78c43abcdd5f12eac5628fb8f7d_f89e7a35d3f44abe8a9eab5344e20c34_v1
+  type: media_player
+  room: 客厅
+  aliases: [客厅的小米电视 电视]
+
+小爱音箱:
+  entity: media_player.xiaomi_cn_866453665_oh2p
+  type: media_player
+  aliases: [Xiaomi 智能音箱 Pro 音箱]
+
+吸顶灯:
+  entity: light.yeelink_cn_314782921_ceiling3_s_2_light
+  type: light
+  aliases: [主卧吸顶灯 灯]
+
+吸顶灯2:
+  entity: light.yeelink_cn_134242093_ceiling3_s_2_light
+  type: light
+  aliases: [书房吸顶灯 灯]
+
+晾衣架灯:
+  entity: light.hyd_cn_333346645_znlyj1_s_3_light
+  type: light
+  aliases: [晾衣架 灯]
+
+皎月吸顶灯:
+  entity: light.yeelink_cn_134242071_ceiling3_s_2_light
+  type: light
+  aliases: [次卧吸顶灯 灯]
+
+# 客厅主灯：靠墙开关供电，开关关掉时 HA 显示 unavailable（属正常，不是坏）
+# 已收录的设备即使离线也会保留：gen_aliases 重跑/重建不会把它删掉
+客厅灯:
+  entity: light.philips_cn_356246127_zyceiling_s_2_light
+  type: light
+  room: 客厅
+  aliases: [客厅主灯, 客厅吸顶灯, 大厅灯]
+
+# 播报相关：勿扰打开时小爱不会念「播放文本」，用户可以口头关掉它
+小爱勿扰:
+  entity: switch.xiaomi_cn_866453665_oh2p_no_disturb_p_9_1
+  type: switch
+  aliases: [勿扰模式, 小爱静音]

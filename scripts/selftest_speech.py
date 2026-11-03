@@ -26,6 +26,18 @@ from jarvis.audio import TARGET_RATE, Mic  # noqa: E402
 from jarvis.config import Settings  # noqa: E402
 from jarvis.tts import SayTTS, probe_voice  # noqa: E402
 
+
+def _cue_module():
+    """拿到同目录的 cue 模块（人工提示用）；导入失败返回 None，不影响自检本身。"""
+    try:
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
+        import cue  # noqa: PLC0415
+
+        return cue
+    except Exception:  # noqa: BLE001
+        return None
+
+
 CASES = [
     ("打开客厅的灯", "高频指令"),
     ("把主卧空调调到二十六度", "含数字"),
@@ -115,13 +127,43 @@ def main() -> int:
 
     if args.mic > 0:
         print(f"\n== 真麦克风 {args.mic:g}s ==")
-        with Mic(st.input_device) as mic:
-            print("现在说话…", file=sys.stderr)
-            pcm = mic.record(args.mic)
-        hyp, ms = asr.transcribe(pcm)
-        print(f"识别：{hyp or '(空)'}  · {ms:.0f}ms · 音频 {pcm.size / TARGET_RATE:.2f}s")
-        if not hyp:
-            print("提示：完全没识别出内容，检查麦克风权限/距离/音量")
+        # 提醒一定被看见：弹窗 + 倒数；录音必须落在红态采集窗口内，不能等「叮」完再录
+        cue = _cue_module()
+        box: dict = {}
+        if cue is not None:
+
+            def _record() -> object:
+                with Mic(st.input_device) as mic:
+                    mic.drain()
+                    return mic.record(args.mic)
+
+            rc = cue.run_cue(
+                f"请对着麦克风正常音量说一句话（随便说什么）\n\n录音 {args.mic:g} 秒",
+                title="home-jarvis 测试 · 真麦克风",
+                seconds=args.mic,
+                countdown_s=3,
+                action=_record,
+                result_box=box,
+                timeout=120,
+            )
+            if rc == cue.EXIT_UNCONFIRMED:
+                print("⚠️  没确认提示，跳过真麦克风测试（未验证）", file=sys.stderr)
+                args.mic = 0.0
+            elif rc != 0 or "value" not in box:
+                print("⚠️  真麦克风录音失败，跳过", file=sys.stderr)
+                args.mic = 0.0
+            else:
+                pcm = box["value"]
+        else:
+            with Mic(st.input_device) as mic:
+                print("现在说话…", file=sys.stderr)
+                pcm = mic.record(args.mic)
+
+        if args.mic > 0:
+            hyp, ms = asr.transcribe(pcm)
+            print(f"识别：{hyp or '(空)'}  · {ms:.0f}ms · 音频 {pcm.size / TARGET_RATE:.2f}s")
+            if not hyp:
+                print("提示：完全没识别出内容，检查麦克风权限/距离/音量")
 
     print()
     print("✅ 语音链路可用（TTS 与 ASR 已打通）" if ok else "❌ 识别质量不达标，先排查音频链路")

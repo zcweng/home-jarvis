@@ -237,7 +237,8 @@ def build_local_tts(settings: Settings, speaker: Speaker | None):
             )
             from .tts import SayTTS
 
-            return SayTTS(settings.tts_voice_say, settings.tts_mode, speaker, rate=settings.say_rate)
+            mode = "wav" if speaker is not None else settings.tts_mode
+            return SayTTS(settings.tts_voice_say, mode, speaker, rate=settings.say_rate)
         return SherpaTTS(
             settings.tts_model_dir,
             num_threads=settings.tts_threads,
@@ -248,4 +249,6 @@ def build_local_tts(settings: Settings, speaker: Speaker | None):
         )
     from .tts import SayTTS
 
-    return SayTTS(settings.tts_voice_say, settings.tts_mode, speaker, rate=settings.say_rate)
+    # 注入了 Speaker/EndpointSpeaker 就必须走 wav 通路，否则 say -direct 仍打本机喇叭
+    mode = "wav" if speaker is not None else settings.tts_mode
+    return SayTTS(settings.tts_voice_say, mode, speaker, rate=settings.say_rate)

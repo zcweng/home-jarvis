@@ -18,22 +18,52 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
+sys.path.insert(0, str(ROOT / "scripts"))
 
 from jarvis.asr import SenseVoice  # noqa: E402
 from jarvis.audio import TARGET_RATE, Mic, Speaker  # noqa: E402
 from jarvis.config import Settings  # noqa: E402
 from jarvis.tts import SayTTS  # noqa: E402
 
+try:
+    import cue as _cue  # noqa: E402
+except Exception:  # noqa: BLE001
+    _cue = None  # type: ignore[assignment]
+
 
 def one_round(st: Settings, asr: SenseVoice, tts: SayTTS, seconds: float, idx: int) -> str:
-    with Mic(st.input_device) as mic:
-        mic.drain()
-        t0 = time.perf_counter()
-        print(f"\n[{idx}] 说话（{seconds:g} 秒）…", flush=True)
-        pcm = mic.record(seconds)
-        t_rec = (time.perf_counter() - t0) * 1000
+    box: dict = {}
+    t0 = time.perf_counter()
 
-    if pcm.size == 0:
+    def _record():
+        with Mic(st.input_device) as mic:
+            mic.drain()
+            return mic.record(seconds)
+
+    if _cue is not None:
+        rc = _cue.run_cue(
+            f"请对着麦克风正常音量说一句话\n\n第 {idx} 轮 · 录音 {seconds:g} 秒",
+            title="home-jarvis 测试 · try_voice",
+            seconds=seconds,
+            countdown_s=3,
+            action=_record,
+            result_box=box,
+            timeout=120,
+        )
+        if rc == _cue.EXIT_UNCONFIRMED:
+            print(f"[{idx}] ⏭ 未确认，跳过本轮（未验证）", flush=True)
+            return ""
+        if rc != 0 or "value" not in box:
+            print(f"[{idx}] ❌ 录音失败")
+            return ""
+        pcm = box["value"]
+    else:
+        print(f"\n[{idx}] 说话（{seconds:g} 秒）…", flush=True)
+        pcm = _record()
+
+    t_rec = (time.perf_counter() - t0) * 1000
+
+    if pcm is None or getattr(pcm, "size", 0) == 0:
         print("❌ 没录到音频")
         return ""
 

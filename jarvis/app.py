@@ -21,7 +21,9 @@ import argparse
 import sys
 import threading
 import time
+from dataclasses import replace
 from pathlib import Path
+from typing import Any, Callable
 
 import numpy as np
 
@@ -29,13 +31,18 @@ from .asr import SenseVoice
 from .audio import TARGET_RATE, Mic, Speaker, read_wav
 from .bargein import BargeInConfig, BargeInDetector
 from .config import Settings
+from .endpoint import (
+    DEFAULT_DOWN_PORT,
+    EndpointMic,
+    EndpointSpeaker,
+    parse_endpoint,
+)
 from .ha import HAClient
 from .intent import looks_like_command
 from .llm import DeepSeek
 from .output import SpeechRouter
 from .session import Session
 from .tools import Tools
-from .tts import SayTTS
 from .vad import Segmenter
 from .kws import DEFAULT_MODEL as KWS_DEFAULT_MODEL
 from .kws import KeywordWake
@@ -76,6 +83,10 @@ def handle_sleep(cmd: str, gate, words: tuple[str, ...], speak) -> bool:
     return True
 
 
+def _is_endpoint(source: str) -> bool:
+    return (source or "").strip().lower() in {"speaker_endpoint", "endpoint", "s12"}
+
+
 class Jarvis:
     def __init__(self, st: Settings | None = None, use_fake_llm: bool = False, speak: bool = True) -> None:
         self.st = st or Settings.load()
@@ -86,22 +97,23 @@ class Jarvis:
         self._ack_idx = 0
         self.interrupted = False
         self._asleep_notice_at = 0.0
+        self._mic_factory, self._speaker, router_st, audio_label = self._build_audio()
         print("加载模型…", file=sys.stderr)
         t0 = time.perf_counter()
         self.asr = SenseVoice(self.st.asr_model_dir, language=self.st.asr_language)
         self.vad_model = self.st.vad_model
-        speaker = Speaker(self.st.output_device) if self.st.tts_mode == "wav" else None
         from .tts_neural import build_local_tts
 
-        local_tts = build_local_tts(self.st, speaker)
+        local_tts = build_local_tts(self.st, self._speaker)
         self.ha = HAClient(self.st)
         self.tools = Tools(self.ha, settings=self.st, announce=lambda text: self.tts.speak(text))
         self.tts = SpeechRouter(
-            self.st,
+            router_st,
             self.ha,
             local_tts,
             notify_entity=lambda: self.tools._speaker_notify(),
         )
+        self._audio_label = audio_label
         if use_fake_llm:
             from .llm_fake import FakeLLM
 
@@ -123,9 +135,31 @@ class Jarvis:
                 print(f"⚠️  {hint.strip('（）')}——说「关掉勿扰」即可恢复播报", file=sys.stderr)
         print(
             f"就绪（{time.perf_counter() - t0:.1f}s）· 设备 {len(self.tools.devices)} 台 · "
-            f"音色 {self.tts.voice} · TTS {self.tts.mode}",
+            f"音色 {self.tts.voice} · TTS {self.tts.mode} · 音频 {self._audio_label}",
             file=sys.stderr,
         )
+
+    def _build_audio(
+        self,
+    ) -> tuple[Callable[[], Any], Any, Settings, str]:
+        """按 AUDIO_SOURCE 选本机或 S12 网络端点。返回 (mic_factory, speaker, router_settings, label)。"""
+        if _is_endpoint(self.st.audio_source):
+            host, up = parse_endpoint(self.st.speaker_endpoint)
+            down = int(self.st.speaker_down_port or DEFAULT_DOWN_PORT)
+            label = f"S12 {host} ↑{up} ↓{down}"
+            print(f"音频端点：{label}（TTS 走本地合成 → 下行 PCM，不经小爱云）", file=sys.stderr)
+
+            def factory() -> EndpointMic:
+                return EndpointMic(host, up)
+
+            # 端点模式下强制 local：用 EndpointSpeaker 播 PCM，避免再走米家 play_text
+            return factory, EndpointSpeaker(host, down), replace(self.st, tts_target="local"), label
+
+        def factory() -> Mic:
+            return Mic(self.st.input_device)
+
+        speaker = Speaker(self.st.output_device) if self.st.tts_mode == "wav" else None
+        return factory, speaker, self.st, f"local:{self.st.input_device or 'default'}"
 
     # ------------------------------------------------------------------ 一轮
 
@@ -135,6 +169,9 @@ class Jarvis:
             return
         if self.tts.target == "speaker":
             # 云端 TTS 没法预渲染，硬插一句"好的"只会让两句话更慢更乱
+            return
+        if _is_endpoint(self.st.audio_source):
+            # 下行单 TCP：非阻塞「好的」会和终答抢同一把 socket 锁，直接死锁
             return
         phrase = self._ack_phrases[self._ack_idx % len(self._ack_phrases)]
         self._ack_idx += 1
@@ -290,8 +327,8 @@ class Jarvis:
         seg = Segmenter(self.vad_model, threshold=self.st.vad_threshold,
                         min_silence=self.st.vad_silence_ms / 1000)
         barge_in = barge_in and self._barge_in_supported()
-        with Mic(self.st.input_device) as mic:
-            print(f"\n常开监听中…（Ctrl+C 退出）{'(处理一句就退出)' if once else ''}")
+        with self._mic_factory() as mic:
+            print(f"\n常开监听中…（Ctrl+C 退出）{'(处理一句就退出)' if once else ''}", flush=True)
             while True:
                 if self._pending:
                     utt = self._pending.pop(0)
@@ -311,7 +348,7 @@ class Jarvis:
 
     def run_ptt(self, once: bool = False) -> None:
         """回车说话：按回车开始录，再按回车结束并立即回答。"""
-        with Mic(self.st.input_device) as mic:
+        with self._mic_factory() as mic:
             while True:
                 try:
                     input("\n按回车开始说话（Ctrl+C 退出）…")
@@ -411,7 +448,7 @@ class Jarvis:
                     self._note_asleep()
             return n
 
-        with Mic(self.st.input_device) as mic:
+        with self._mic_factory() as mic:
             print("（Ctrl+C 退出）")
             while True:
                 chunk = mic.read(timeout=0.5)
@@ -421,7 +458,7 @@ class Jarvis:
                     hit = kws.feed(chunk)
                     if hit:
                         gate.touch()
-                        print(f"  🟢 唤醒「{hit}」")
+                        print(f"  🟢 唤醒（KWS）「{hit}」")
                 for utt in seg.accept(chunk):
                     if not gate.awake:
                         self._note_asleep()
@@ -434,7 +471,7 @@ class Jarvis:
         """ASR 门控后端（不需要 KWS 模型）。"""
         print(f"\n唤醒词：{gate.words_hint()}（唤醒后 {gate.follow_up_seconds:g} 秒内免唤醒）")
 
-        def _process(utt: np.ndarray, mic: Mic | None) -> bool:
+        def _process(utt: np.ndarray, mic: Any | None) -> bool:
             text, ms = self.asr.transcribe(utt)
             if not text.strip():
                 return False
@@ -477,7 +514,7 @@ class Jarvis:
 
         seg = Segmenter(self.vad_model, threshold=self.st.vad_threshold,
                         min_silence=self.st.vad_silence_ms / 1000)
-        with Mic(self.st.input_device) as mic:
+        with self._mic_factory() as mic:
             print("（Ctrl+C 退出）")
             while True:
                 chunk = mic.read(timeout=1.0)
@@ -499,9 +536,24 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--no-speak", action="store_true", help="只打印不朗读（批量自检用）")
     ap.add_argument("--wake", action="store_true", help="唤醒词模式（先用唤醒词，之后连续对话）")
     ap.add_argument("--wake-backend", choices=["kws", "asr"], default="", help="唤醒后端，默认 kws")
+    ap.add_argument(
+        "--endpoint",
+        nargs="?",
+        const="192.168.1.3",
+        default="",
+        metavar="HOST",
+        help="用 S12 网络端点做麦+喇叭（等价 AUDIO_SOURCE=speaker_endpoint）",
+    )
     args = ap.parse_args(argv)
 
-    app = Jarvis(use_fake_llm=args.fake_llm, speak=not args.no_speak)
+    st = Settings.load()
+    if args.endpoint:
+        st = replace(
+            st,
+            audio_source="speaker_endpoint",
+            speaker_endpoint=args.endpoint,
+        )
+    app = Jarvis(st=st, use_fake_llm=args.fake_llm, speak=not args.no_speak)
     try:
         if args.wake:
             return 0 if app.run_wake(args.wav, backend=args.wake_backend) else 1
@@ -519,6 +571,12 @@ def main(argv: list[str] | None = None) -> int:
         app.ha.close()
         if hasattr(app.llm, "close"):
             app.llm.close()
+        spk = getattr(app, "_speaker", None)
+        if spk is not None and hasattr(spk, "close"):
+            try:
+                spk.close()
+            except Exception:  # noqa: BLE001
+                pass
     return 0
 
 

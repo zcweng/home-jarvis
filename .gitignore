@@ -9,11 +9,9 @@
 docker/config/
 docker/*/data/
 
-# 设备别名表：每家的设备都不一样，自己生成（模板见 config/aliases.example.yaml）
-config/aliases.yaml
-
-# 本机 agent 记忆与个人上下文（不公开）
-.agents/
+# 公开 main：aliases / .agents 不进库。本 feature 分支需要完整联调配置，故跟踪它们。
+# config/aliases.yaml
+# .agents/
 
 # 模型文件（用 scripts/fetch_models.sh 在目标机重新下）
 models/
@@ -38,3 +36,8 @@ debug/
 # 编辑器
 .idea/
 .vscode/
+
+# ---- feature/s12-endpoint 私有联调约定 ----
+# 固件整包不进库（脚本可进）
+backup/s12-*/
+tools/s12audio/build/

@@ -21,10 +21,12 @@ class HAClient:
         if not st.ha_token:
             raise HAError("缺少 HA_TOKEN，先执行 python3 scripts/set_ha_token.py")
         self.base = st.ha_url.rstrip("/")
+        # trust_env=False：本机/内网 HA 不要走系统 HTTP 代理（否则 127.0.0.1 会卡到超时）
         self._client = httpx.Client(
             base_url=self.base,
             headers={"Authorization": f"Bearer {st.ha_token}", "Content-Type": "application/json"},
             timeout=timeout,
+            trust_env=False,
         )
 
     # ------------------------------------------------------------------ 读

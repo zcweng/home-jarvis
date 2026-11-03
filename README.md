@@ -196,6 +196,18 @@ CI 只跑**离线、无需音频设备**的部分（`python -m compileall`、文
 .venv/bin/python scripts/selftest_tts_text.py --pure   # 纯 Python，CI 同款
 ```
 
+需要人出声 / 拍手 / 走近设备的测试，一律先弹交互提示，不会只写在终端里：
+
+```bash
+.venv/bin/python scripts/cue.py "请面对音箱大声说：客厅灯打开" --seconds 5
+.venv/bin/python scripts/cue.py "请连续拍手 3 次" --seconds 4 --run "<取数命令>"
+.venv/bin/python scripts/cue.py "接下来我会重启设备，你不用操作" --ack-only
+```
+
+置顶对话框 + 提示音 + 「三、二、一」语音倒数，采集结束再「叮」一声并弹通知；
+退出码 `2` 表示没人确认（超时或点跳过），此时该段人工测试记为「未验证」而不是通过。
+CI / 无桌面环境用 `CUE_NO_GUI=1` 退回终端提示。
+
 ---
 
 ## 目录结构

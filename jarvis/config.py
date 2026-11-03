@@ -64,6 +64,10 @@ class Settings:
     # 音频
     input_device: str = "外置麦克风"
     output_device: str = "MacBook Pro扬声器"
+    # local=本机麦/喇叭 | speaker_endpoint=S12 网络端点（tools/s12audio）
+    audio_source: str = "local"
+    speaker_endpoint: str = "192.168.1.3"  # host 或 tcp://host:8765（上行）
+    speaker_down_port: int = 8766          # 下行 PCM 端口
     # ASR
     asr_model_dir: str = "models/sensevoice"
     asr_language: str = "zh"
@@ -109,6 +113,9 @@ class Settings:
             deepseek_key=_env("DEEPSEEK_KEY", cls.deepseek_key),
             input_device=_env("INPUT_DEVICE", cls.input_device),
             output_device=_env("OUTPUT_DEVICE", cls.output_device),
+            audio_source=_env("AUDIO_SOURCE", cls.audio_source),
+            speaker_endpoint=_env("SPEAKER_ENDPOINT", cls.speaker_endpoint),
+            speaker_down_port=_env_int("SPEAKER_DOWN_PORT", cls.speaker_down_port),
             asr_model_dir=_env("ASR_MODEL_DIR", cls.asr_model_dir),
             asr_language=_env("ASR_LANGUAGE", cls.asr_language),
             tts_backend=_env("TTS_BACKEND", cls.tts_backend),

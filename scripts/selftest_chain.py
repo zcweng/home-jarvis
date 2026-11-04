@@ -46,7 +46,7 @@ def synth(text: str) -> Path:
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--speak", action="store_true", help="真的朗读回复")
-    ap.add_argument("--real-llm", action="store_true", help="用真实 DeepSeek（需有效 key）")
+    ap.add_argument("--real-llm", action="store_true", help="用真实 LLM（需有效 LLM_API_KEY / DEEPSEEK_KEY）")
     args = ap.parse_args()
 
     st = Settings.load()

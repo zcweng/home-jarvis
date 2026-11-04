@@ -33,8 +33,8 @@ import soxr
 
 # --------------------------------------------------------------------------- 协议常量
 
-TARGET_RATE = 16000           # 与 jarvis.audio.TARGET_RATE 一致
-FRAME_SAMPLES = 160           # 10ms @16k，与设备端 FRAME_SAMPLES 对应
+TARGET_RATE = 16000  # 与 jarvis.audio.TARGET_RATE 一致
+FRAME_SAMPLES = 160  # 10ms @16k，与设备端 FRAME_SAMPLES 对应
 FRAME_BYTES = FRAME_SAMPLES * 2
 
 # 下行帧 type
@@ -91,6 +91,18 @@ class UplinkReader:
         self._sock: socket.socket | None = None
         self._buf = bytearray()
         self.reconnects = 0
+        self.stale_after = 3.0
+        self._last_data = _now()
+        self._last_read = 0.0  # 0 = 还没开始读；用于区分「上层在忙」和「半开」
+        self._last_warn = 0.0
+
+    def _warn(self, msg: str) -> None:
+        """设备离线期间每秒都会失败一次，限频到 10s 一条，别把终端淹没。"""
+        now = _now()
+        if now - self._last_warn < 10.0:
+            return
+        self._last_warn = now
+        print(msg, file=sys.stderr)
 
     # -- 连接
 
@@ -99,12 +111,13 @@ class UplinkReader:
         try:
             s = socket.create_connection((self.host, self.port), timeout=timeout)
         except OSError as e:
-            print(f"⚠️  上行连接失败 {self.host}:{self.port} — {e}", file=sys.stderr)
+            self._warn(f"⚠️  上行连接失败 {self.host}:{self.port} — {e}")
             return False
         s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         s.settimeout(0.05)  # 短超时，攒帧交给外层循环
         self._sock = s
         self._buf.clear()
+        self._last_data = _now()
         return True
 
     def close(self) -> None:
@@ -126,14 +139,30 @@ class UplinkReader:
 
         min_samples/rate 必须明显小于 timeout，否则永远攒不满。
         """
+        now = _now()
+        # 无 barge-in 时，LLM / 播报会阻塞主线程数秒，期间根本不调 read。
+        # 设备侧仍在推流（推不动就丢帧），链路并没死。若把这段墙钟算进
+        # stale，一回来就会误判重连。只有「连续在读」时的无数据才算半开。
+        if self._last_read and now - self._last_read > self.stale_after:
+            self._last_data = now
+        self._last_read = now
+
         want = min_samples * 2
-        deadline = _now() + timeout
+        deadline = now + timeout
         while len(self._buf) < want and _now() < deadline:
             if self._sock is None:
                 if not self.connect():
                     time.sleep(0.5)
                     continue
                 self.reconnects += 1
+            # 设备重启 / 断电时不会发 FIN，socket 会停在半开的 ESTABLISHED，
+            # recv 只是超时、永远等不到数据。设备侧是 50 帧/秒的连续流，
+            # 在「连续读取」期间超过 stale_after 一个字节都没收到 → 主动重连。
+            if _now() - self._last_data > self.stale_after:
+                self._warn(f"⚠️  上行 {self.stale_after:.0f}s 无数据，重连 {self.host}:{self.port}")
+                self.close()
+                self.reconnects += 1
+                continue
             try:
                 chunk = self._sock.recv(262144)
             except socket.timeout:
@@ -144,6 +173,7 @@ class UplinkReader:
             if not chunk:
                 self.close()
                 continue
+            self._last_data = _now()
             self._buf.extend(chunk)
 
         n = len(self._buf) // 2

@@ -61,7 +61,12 @@ class Settings:
     llm_model: str = "deepseek-flash"
     llm_base_url: str = "https://api.deepseek.com"
     llm_timeout: float = 3.0
-    deepseek_key: str = ""
+    llm_api_key: str = ""          # 通用密钥；空则回退 DEEPSEEK_KEY
+    deepseek_key: str = ""         # DeepSeek 回退别名（兼容旧 .env）
+    llm_provider: str = ""         # 空=按 base_url 推断；deepseek 时默认关 thinking
+    llm_disable_thinking: bool = False  # 强制给请求带 thinking.disabled
+    # MCP：JSON 数组，如 [{"type":"stdio","command":"npx","args":["-y","@modelcontextprotocol/server-filesystem","/tmp"]}]
+    mcp_servers: str = ""
     # 音频
     input_device: str = "外置麦克风"
     output_device: str = "MacBook Pro扬声器"
@@ -134,7 +139,11 @@ class Settings:
             llm_model=_env("LLM_MODEL", cls.llm_model),
             llm_base_url=_env("LLM_BASE_URL", cls.llm_base_url),
             llm_timeout=_env_float("LLM_TIMEOUT", cls.llm_timeout),
+            llm_api_key=_env("LLM_API_KEY", cls.llm_api_key),
             deepseek_key=_env("DEEPSEEK_KEY", cls.deepseek_key),
+            llm_provider=_env("LLM_PROVIDER", cls.llm_provider),
+            llm_disable_thinking=_env("LLM_DISABLE_THINKING", "false").lower() in ("1", "true", "yes"),
+            mcp_servers=_env("MCP_SERVERS", cls.mcp_servers),
             input_device=_env("INPUT_DEVICE", cls.input_device),
             output_device=_env("OUTPUT_DEVICE", cls.output_device),
             audio_source=_env("AUDIO_SOURCE", cls.audio_source),

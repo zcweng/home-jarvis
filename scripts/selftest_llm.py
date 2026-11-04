@@ -10,15 +10,14 @@
 from __future__ import annotations
 
 import sys
-import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
+from jarvis.agent_runtime import JarvisAgent  # noqa: E402
 from jarvis.config import Settings  # noqa: E402
 from jarvis.ha import HAClient  # noqa: E402
-from jarvis.llm import DeepSeek  # noqa: E402
 from jarvis.session import Session  # noqa: E402
 from jarvis.tools import Tools  # noqa: E402
 
@@ -49,25 +48,16 @@ def main() -> int:
     target = dev.name
     print(f"测试目标：{target}（{dev.entity_id}）")
     session = Session.load(tools.catalog())
-    llm = DeepSeek(st)
+    llm = JarvisAgent(st, tools, session=session)
 
     def turn(text: str):
         msgs = session.messages(text)
-        t0 = time.perf_counter()
-        res = llm.chat(msgs, tools.schemas(), dispatch=dispatch)
+        res = llm.chat(msgs)
         session.add_user(text)
         session.add_assistant(res.text)
         print(f"   耗时 {res.latency_ms:.0f}ms · 轮次 {res.rounds} · 工具调用 "
               f"{[c.name for c in res.tool_calls] or '无'}")
         return res
-
-    def dispatch(name: str, args: dict) -> str:
-        out = tools.dispatch(name, args)
-        if name in ("control", "query"):
-            dev = tools.resolve(str(args.get("device", "")))
-            session.note_action(dev.name if dev else str(args.get("device", "")),
-                                str(args.get("action", "")), args.get("value"), out)
-        return out
 
     # 1. 纯聊天（不应调用工具）
     print("① 纯聊天：你好，你能做什么")
@@ -79,8 +69,8 @@ def main() -> int:
     print("\n② 明确指令：把客厅灯打开")
     r2 = turn(f"把{target}打开")
     called = [c for c in r2.tool_calls if c.name == "control"]
-    ok2 = bool(called) and called[0].arguments.get("action") in ("on", "打开")
-    check("识别出 control 工具", bool(called), str([c.arguments for c in called])[:80])
+    right_action = bool(called) and called[0].arguments.get("action") in ("on", "打开")
+    check("识别出 control 工具", right_action, str([c.arguments for c in called])[:80])
     state = (ha.state(dev.entity_id) or {}).get("state")
     check("HA 状态真的变了", state == "on", f"light={state}")
     check("回答有确认文本", bool(r2.text), (r2.text or "")[:50])
@@ -107,10 +97,19 @@ def main() -> int:
     text5 = (r5.text or "") + " ".join(o for _, o in r5.tool_results)
     check("不虚构设备", no_bogus, text5[:80])
 
-    # 6. 闲聊不误触工具
-    print("\n⑥ 闲聊：今天适合跑步吗")
-    r6 = turn("今天适合出去跑步吗？")
-    check("闲聊不误触工具", not r6.tool_calls, str([c.name for c in r6.tool_calls]))
+    # 6. 闲聊/天气边界：不良问句不该误触 control/query
+    #   「今天适合出去跑步吗」这类由 intent.looks_like_weather 兜底，
+    #   这里只断言不会误判成设备控制（误判成 weather 是允许的）。
+    print("\n⑥ 闲聊：给我讲个冷笑话 / 今天适合出去跑步吗")
+    for text6 in ("给我讲个冷笑话", "今天适合出去跑步吗？", "明天要穿外套吗"):
+        r6 = turn(text6)
+        bad6 = [c.name for c in r6.tool_calls if c.name in ("control", "query", "scene", "timer")]
+        check(f"闲聊不误触设备工具：{text6}", not bad6, str([c.name for c in r6.tool_calls]))
+
+    from jarvis.intent import looks_like_weather
+
+    check("跑步问句识别为天气类", looks_like_weather("今天适合出去跑步吗？"))
+    check("穿外套问句识别为天气类", looks_like_weather("明天要穿外套吗"))
 
     # 7. 守卫：模型编造"已执行"时必须被强制拉回工具调用
     print("\n⑦ 守卫：模拟模型不调工具、直接回复已经关了")

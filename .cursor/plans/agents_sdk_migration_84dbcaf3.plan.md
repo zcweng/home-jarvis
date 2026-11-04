@@ -4,25 +4,25 @@ overview: 将 Jarvis 的 DeepSeek 手写 tool-loop 替换为 OpenAI Agents SDK�
 todos:
   - id: agent-runtime
     content: "Add jarvis/agent_runtime.py: OpenAIChatCompletionsModel + Runner.run_sync + LLMResult adapter + DeepSeek thinking disable"
-    status: pending
+    status: completed
   - id: agent-tools
     content: Wrap Tools as @function_tool in jarvis/agent_tools.py; move note_action into tool/hook path
-    status: pending
+    status: completed
   - id: app-guard-hooks
     content: Hard-cut app.py/chat_with_guard to runtime; RunHooks.on_tool_start for early ack
-    status: pending
+    status: completed
   - id: config-llm-mcp
     content: "Settings: LLM_API_KEY fallback, MCP_SERVERS; .env.example + pyproject openai-agents"
-    status: pending
+    status: completed
   - id: session-prompt
     content: Feed session.system_prompt + history into Agent instructions/input each turn
-    status: pending
+    status: completed
   - id: fake-selftest
     content: Align FakeLLM surface; update selftest_llm/wake/chain for Agents cutover
-    status: pending
+    status: completed
   - id: docs-cleanup
     content: README/docs update; remove hand-rolled DeepSeek tool-loop; note SearXNG plan follow-up
-    status: pending
+    status: completed
 isProject: false
 ---
 

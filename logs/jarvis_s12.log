@@ -1,0 +1,40 @@
+音频端点：S12 192.168.1.3 ↑8765 ↓8766（TTS 走本地合成 → 下行 PCM，不经小爱云）
+灯环：192.168.1.3（待命熄灭 / 唤醒常亮蓝 / 思考蓝呼吸 / 播报蓝 / 出错红 / 麦禁用黄呼吸）
+音量：70%（环调节 → 蓝灯弧 + 播放增益；UDP :8769）
+加载模型…
+音量/麦键：UDP :8769（V<pct> / M0|M1）
+预渲染应答短语 5 条（首句可 0ms 出声）
+就绪（3.7s）· 设备 11 台 · 音色 vits-zh-hf-fanchen-C · TTS local · 音频 S12 192.168.1.3 ↑8765 ↓8766
+  VAD 静音门限 800ms（端点加长）
+
+唤醒词（KWS 专用模型）：贾维斯、小贾、管家 · 唤醒后 8s 免唤醒
+（Ctrl+C 退出）
+  💤 未唤醒，已忽略（喊唤醒词才能唤起）
+  💤 未唤醒，已忽略（喊唤醒词才能唤起）
+  💤 未唤醒，已忽略（喊唤醒词才能唤起）
+  💤 未唤醒，已忽略（喊唤醒词才能唤起）
+  💤 未唤醒，已忽略（喊唤醒词才能唤起）
+  🟢 唤醒（KWS）「小贾」· 等整句说完再识别
+  🎙  ASR 段 0.57s -25dBFS → 「小贾。」 (98ms)
+  🟢 我在，说吧
+  🎙  ASR 段 1.34s -27dBFS → 「天该怎么穿衣服？」 (50ms)
+  👤 天该怎么穿衣服   (50ms ASR)
+  🔗 LLM 调用：user=「天该怎么穿衣服」 model=deepseek-flash base=https://api.deepseek.com provider=deepseek timeout=3s key=sk-c…b006（len=35） mcp=0/0
+  ⚡ 先出声「好的」(0.0ms)
+  🤖 成都现在16度，白天最高21度，晴转多云，穿件长袖加薄外套就行，早晚凉，出门带一件。   (3087ms LLM · 2 轮 · 工具 weather)
+  🔊 播报 12543ms
+  ⏳ 窗口从播报结束后重新计时：8 秒内可直接说下一句
+  🎙  ASR 段 0.60s -24dBFS → 「明天呢。」 (34ms)
+  👤 明天呢   (34ms ASR)
+  🔗 LLM 调用：user=「明天呢」 model=deepseek-flash base=https://api.deepseek.com provider=deepseek timeout=3s key=sk-c…b006（len=35） mcp=0/0
+  ⚡ 先出声「嗯」(0.0ms)
+  🤖 明天多云，14到21度，跟今天差不多，长袖加薄外套就够了。后天有小雨，记得带伞。   (2164ms LLM · 2 轮 · 工具 weather)
+  🔊 播报 11340ms
+  ⏳ 窗口从播报结束后重新计时：8 秒内可直接说下一句
+  🎙  ASR 段 0.54s -29dBFS → 「谢谢。」 (43ms)
+  👤 谢谢   (43ms ASR)
+  🔗 LLM 调用：user=「谢谢」 model=deepseek-flash base=https://api.deepseek.com provider=deepseek timeout=3s key=sk-c…b006（len=35） mcp=0/0
+  🤖 不客气，出门注意早晚温差。   (795ms LLM · 1 轮 · 工具 无)
+  🔊 播报 3445ms
+  ⏳ 窗口从播报结束后重新计时：8 秒内可直接说下一句
+  🎙  ASR 段 0.38s -26dBFS → 「再见。」 (35ms)

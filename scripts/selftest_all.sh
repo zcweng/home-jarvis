@@ -41,6 +41,8 @@ run "TTS 数字归一化"      $PY scripts/selftest_tts_text.py
 run "Nano TTS 侧车"       $PY scripts/selftest_nano_tts.py
 run "KWS 专用唤醒词"      $PY scripts/selftest_kws.py
 run "设备工具层"          $PY scripts/selftest_tools.py
+run "网络音频端点"        $PY scripts/selftest_endpoint.py
+run "Agents 运行时"       $PY scripts/selftest_agent_runtime.py
 
 if [[ $FAST -eq 0 ]]; then
   run "语音合成/识别往返"  $PY scripts/selftest_speech.py

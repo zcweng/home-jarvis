@@ -40,7 +40,7 @@ from .endpoint import (
 )
 from .ha import HAClient
 from .intent import looks_like_command, looks_like_weather, looks_like_web_search
-from .llm import DeepSeek
+from .agent_runtime import JarvisAgent
 from .output import SpeechRouter
 from .session import Session
 from .tools import Tools
@@ -88,6 +88,22 @@ def chat_with_guard(
     )
     retry.forced = True
     return retry
+
+
+def _is_transient_llm_error(exc: BaseException, msg: str) -> bool:
+    """上游抖动（超时/连接/5xx/忙）当作可播报的网络故障，而不是致命错误。"""
+    if isinstance(exc, httpx.TimeoutException | httpx.TransportError):
+        return True
+    text = (msg or "").lower()
+    return (
+        "http 5" in text
+        or "http 429" in text
+        or "too busy" in text
+        or "unavailable" in text
+        or "timed out" in text
+        or "timeout" in text
+        or "connection" in text
+    )
 
 
 def handle_sleep(cmd: str, gate, words: tuple[str, ...], speak) -> bool:
@@ -141,14 +157,14 @@ class Jarvis:
             notify_entity=lambda: self.tools._speaker_notify(),
         )
         self._audio_label = audio_label
+        self.session = Session.load(self.tools.catalog())
         if use_fake_llm:
             from .llm_fake import FakeLLM
 
-            self.llm = FakeLLM()
+            self.llm = FakeLLM(devices=list(self.tools.devices))
             print("⚠️  使用假模型（只验证编排，不代表模型能力）", file=sys.stderr)
         else:
-            self.llm = DeepSeek(self.st)
-        self.session = Session.load(self.tools.catalog())
+            self.llm = JarvisAgent(self.st, self.tools, session=self.session)
         self._here_phrase = "我在"
         self._awake_announced_at = 0.0
         if speak and self._ack_phrases:
@@ -392,17 +408,13 @@ class Jarvis:
         except httpx.TransportError as e:
             print(f"  ⚠️  LLM 网络错误：{e}", file=sys.stderr)
             return self._speak_network_glitch(mic)
-        except RuntimeError as e:
-            # DeepSeek 忙/5xx 会走这里（_post 转成 RuntimeError）
+        except Exception as e:  # noqa: BLE001
+            # 运行时已把 SDK/openai 异常归一化成 httpx / RuntimeError；
+            # 这里仍按文案兜一层，避免换运行时后又把主循环带走。
             msg = str(e)
-            if "HTTP 5" in msg or "too busy" in msg.lower() or "unavailable" in msg.lower():
+            if _is_transient_llm_error(e, msg):
                 print(f"  ⚠️  LLM 服务异常：{e}", file=sys.stderr)
                 return self._speak_network_glitch(mic)
-            self._led("error")
-            time.sleep(1.2)
-            self._led("listen")
-            raise
-        except Exception:
             self._led("error")
             time.sleep(1.2)
             self._led("listen")

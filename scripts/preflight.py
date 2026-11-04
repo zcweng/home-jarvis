@@ -120,17 +120,31 @@ def check_env_file() -> None:
 
     env = Path(__file__).resolve().parent.parent / ".env"
     if not env.exists():
-        print(f"{WARN} 没有 .env（复制 .env.example 后填 HA_TOKEN / DEEPSEEK_KEY）")
+        print(f"{WARN} 没有 .env（复制 .env.example 后填 HA_TOKEN / LLM_API_KEY）")
         return
-    missing = [k for k in ("HA_TOKEN", "DEEPSEEK_KEY") if not os.environ.get(k)]
     txt = env.read_text(encoding="utf-8", errors="ignore")
-    miss_in_file = [k for k in ("HA_TOKEN", "DEEPSEEK_KEY") if f"{k}=" not in txt]
+    has_llm = (
+        bool(os.environ.get("LLM_API_KEY"))
+        or bool(os.environ.get("DEEPSEEK_KEY"))
+        or "LLM_API_KEY=" in txt
+        or "DEEPSEEK_KEY=" in txt
+    )
+    miss_in_file = []
+    if "HA_TOKEN=" not in txt:
+        miss_in_file.append("HA_TOKEN")
+    if not has_llm:
+        miss_in_file.append("LLM_API_KEY|DEEPSEEK_KEY")
     if miss_in_file:
         print(f"{WARN} .env 缺字段：{', '.join(miss_in_file)}")
     else:
         print(f"{OK} .env 存在且关键字段齐全")
-    if missing:
-        print(f"   （注意：shell 环境变量里没导出 {', '.join(missing)}，程序需自己读 .env）")
+    missing_env = []
+    if not os.environ.get("HA_TOKEN"):
+        missing_env.append("HA_TOKEN")
+    if not (os.environ.get("LLM_API_KEY") or os.environ.get("DEEPSEEK_KEY")):
+        missing_env.append("LLM_API_KEY|DEEPSEEK_KEY")
+    if missing_env:
+        print(f"   （注意：shell 环境变量里没导出 {', '.join(missing_env)}，程序需自己读 .env）")
 
 
 def main() -> int:

@@ -6,7 +6,7 @@
 >
 > English: a self-hosted Chinese voice assistant for the smart home — wake word, multi-turn
 > follow-up, barge-in, and **real** Mijia device control via Home Assistant. ASR/TTS/wake word all
-> run locally (sherpa-onnx); only the LLM call goes out to DeepSeek.
+> run locally (sherpa-onnx); only the LLM call goes out to an OpenAI-compatible API (default DeepSeek).
 
 ![Python](https://img.shields.io/badge/python-3.10%2B-blue)
 ![Platform](https://img.shields.io/badge/platform-macOS%20%C2%B7%20Linux-lightgrey)
@@ -45,8 +45,8 @@ TTS 首字 ~200ms · **端到端首字 ≈1.5s**。
         │   ↓ 文本                                                    │
         │ wake.py 唤醒门（KWS / ASR 门控 + FOLLOW_UP 窗口 + 收线词）    │
         │   ↓                                                         │
-        │ app.py 会话状态机 → llm.py（DeepSeek function calling）      │
-        │                     ↕ 工具层 tools.py：control/query/announce│
+        │ app.py 会话状态机 → agent_runtime（OpenAI Agents SDK）       │
+        │                     ↕ 本地 tools + 可选 MCP 外部数据源       │
         │   ↓ 回复文本                                                 │
         │ textnorm.py 数字/单位 → 中文读法 → tts_neural.py 或 tts.py   │
         │ output.py SpeechRouter：local 电脑喇叭 / speaker 小爱 / both  │
@@ -62,6 +62,8 @@ TTS 首字 ~200ms · **端到端首字 ≈1.5s**。
 
 一个进程、四个可替换适配器（ASR / TTS / LLM / 工具），全部配置驱动；
 设备一律按**中文名子串**匹配，绝不写设备索引（插拔一次索引就变）。
+LLM 走 **OpenAI Agents SDK**（Chat Completions 兼容），家电工具仍是本地 FunctionTool；
+外部数据源可通过 `MCP_SERVERS` 挂 MCP。联网搜索若再升级为 SearXNG/Crawl4AI，应接在 Agents 工具或 MCP 上，而非手写 tool-loop。
 将来接 ESP32-S3 当远端端点，只替换音频层，状态机与工具层不动。
 
 ---
@@ -74,7 +76,7 @@ TTS 首字 ~200ms · **端到端首字 ≈1.5s**。
 - **Docker**（跑 Home Assistant）
 - **ffmpeg**（音频兜底转码，可选但建议）
 - **macOS**：默认 TTS 用本地 VITS，备选系统 `say`。Linux 上把 `TTS_BACKEND=say` 换掉即可
-- **DeepSeek API Key**：<https://platform.deepseek.com/api_keys>
+- **LLM API Key**：默认 DeepSeek（<https://platform.deepseek.com/api_keys>）；也可换其它 OpenAI 兼容网关（`LLM_BASE_URL` + `LLM_API_KEY`）
 - **一个米家账号 + Home Assistant**：手机能控的设备都能被接管
 
 ### 1. 装依赖
@@ -83,7 +85,7 @@ TTS 首字 ~200ms · **端到端首字 ≈1.5s**。
 git clone https://github.com/zcweng/home-jarvis.git
 cd home-jarvis
 UV_CACHE_DIR=.uv-cache uv sync --extra asr --extra vad --extra kws
-cp .env.example .env          # 然后填 HA_TOKEN / DEEPSEEK_KEY
+cp .env.example .env          # 然后填 HA_TOKEN / LLM_API_KEY（或 DEEPSEEK_KEY）
 python3 scripts/preflight.py  # 环境自检：Python/uv/ffmpeg/Docker/语音设备
 ```
 
@@ -157,7 +159,9 @@ python scripts/gen_aliases.py             # 追加写入 config/aliases.yaml（�
 | 变量 | 默认 | 说明 |
 |---|---|---|
 | `HA_TOKEN` / `HA_URL` | — / `http://127.0.0.1:8123` | HA 长期令牌与地址（令牌只在这里，别提交） |
-| `DEEPSEEK_KEY` / `LLM_MODEL` | — / `deepseek-flash` | 控制类走 flash；闲聊可换大模型 |
+| `LLM_API_KEY` / `DEEPSEEK_KEY` | — | 优先 `LLM_API_KEY`；未设时回退 `DEEPSEEK_KEY` |
+| `LLM_MODEL` / `LLM_BASE_URL` | `deepseek-flash` / DeepSeek | 任意 OpenAI 兼容 Chat Completions 端点 |
+| `MCP_SERVERS` | 空 | 可选 MCP（JSON 数组：`stdio` / `http`），挂到 Agents SDK |
 | `INPUT_DEVICE` / `OUTPUT_DEVICE` | `外置麦克风` / 系统默认 | **按名字子串匹配**，不写索引；未命中回落默认并告警 |
 | `TTS_BACKEND` | `neural` | `neural`=本地 VITS｜`nano`=MOSS-TTS-Nano 侧车（中英混读）｜`say`=系统合成 |
 | `TTS_NANO_URL` | `http://127.0.0.1:8091` | Nano 侧车地址；先 `./scripts/nano_tts_server.sh start --bg` |
@@ -219,7 +223,9 @@ jarvis/                会话与适配器
   audio.py             录音/播放/电平表/可打断
   vad.py  asr.py       silero-vad 断句 · SenseVoice 识别
   kws.py  wake.py      专用唤醒词 · 唤醒门（续聊窗口/收线）
-  llm.py  intent.py    DeepSeek 调用 + 「编造已执行」守卫
+  agent_runtime.py     OpenAI Agents SDK（可切换 LLM + 可选 MCP）
+  agent_tools.py       Tools → FunctionTool
+  llm.py  intent.py    LLMResult 类型 + 「编造已执行」守卫
   tools.py             工具层：control / query / announce / 定时
   tts_neural.py tts.py 本地 VITS · macOS say（带音色体检）
   textnorm.py          数字/单位 → 中文读法
@@ -304,7 +310,7 @@ tools/s12common-regression.sh 192.168.1.3
   `docker/config/` 里会有小米账号 token 明文，`aliases.yaml` 里有你家设备 ID。
 - Home Assistant **只监听本机**，不要直接暴露公网；要远程就上 Tailscale / 内网穿透 + 鉴权。
 - 语音不出机器：ASR / VAD / 唤醒 / TTS 全在本地（sherpa-onnx），
-  只有**识别后的文本**会发给 DeepSeek 换回复。
+  只有**识别后的文本**会发给 LLM（默认 DeepSeek，可换 OpenAI 兼容端点）换回复。
 - 建议给磁盘开 FileVault（macOS）/ LUKS（Linux），令牌泄漏才是真风险。
 - 仓库里的 `config/aliases.example.yaml` 与文档中的 entity_id 全是**占位示例**。
 - 安全问题请按 [`SECURITY.md`](SECURITY.md) 私下报告。

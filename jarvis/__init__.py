@@ -11,7 +11,9 @@
     tts_neural.py   语音合成：本地 VITS（默认）
     textnorm.py     数字/单位 → 中文读法（神经 TTS 前置）
     output.py       输出路由：电脑喇叭 / 小爱音箱 / 两边
-    llm.py          DeepSeek function calling
+    llm.py          LLMResult / ToolCall 类型
+    agent_runtime.py OpenAI Agents SDK（可切换 LLM + 可选 MCP）
+    agent_tools.py  Tools → FunctionTool 包装
     intent.py       命令式意图判定（防「编造已执行」）
     tools.py        家电控制工具契约（HA REST）
     session.py      上下文 / 指代消解

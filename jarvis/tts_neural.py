@@ -224,29 +224,61 @@ if __name__ == "__main__":
     raise SystemExit(_main())
 
 
-def build_local_tts(settings: Settings, speaker: Speaker | None):
-    """按 TTS_BACKEND 选本地合成器：say（默认，快但生硬）| neural（自然，稍慢）。"""
-    backend = (settings.tts_backend or "say").lower()
-    if backend in ("neural", "sherpa", "vits"):
-        model_dir = Path(settings.tts_model_dir)
-        if not model_dir.exists() or not any(model_dir.glob("*.onnx")):
-            print(
-                f"⚠️  找不到神经 TTS 模型 {model_dir}，暂时回落到 macOS say"
-                f"（下载：./scripts/fetch_models.sh tts）",
-                file=sys.stderr,
-            )
-            from .tts import SayTTS
+def _build_sherpa(settings: Settings, speaker: Speaker | None):
+    model_dir = Path(settings.tts_model_dir)
+    if not model_dir.exists() or not any(model_dir.glob("*.onnx")):
+        print(
+            f"⚠️  找不到神经 TTS 模型 {model_dir}，暂时回落到 macOS say"
+            f"（下载：./scripts/fetch_models.sh tts）",
+            file=sys.stderr,
+        )
+        from .tts import SayTTS
 
-            mode = "wav" if speaker is not None else settings.tts_mode
-            return SayTTS(settings.tts_voice_say, mode, speaker, rate=settings.say_rate)
-        return SherpaTTS(
-            settings.tts_model_dir,
-            num_threads=settings.tts_threads,
-            sid=settings.tts_sid,
-            speed=settings.tts_speed,
+        mode = "wav" if speaker is not None else settings.tts_mode
+        return SayTTS(settings.tts_voice_say, mode, speaker, rate=settings.say_rate)
+    return SherpaTTS(
+        settings.tts_model_dir,
+        num_threads=settings.tts_threads,
+        sid=settings.tts_sid,
+        speed=settings.tts_speed,
+        speaker=speaker,
+        output_device=settings.output_device,
+    )
+
+
+def _build_fallback(settings: Settings, speaker: Speaker | None):
+    name = (settings.tts_nano_fallback or "neural").lower()
+    if name in ("none", "off", ""):
+        return None
+    if name == "say":
+        from .tts import SayTTS
+
+        mode = "wav" if speaker is not None else settings.tts_mode
+        return SayTTS(settings.tts_voice_say, mode, speaker, rate=settings.say_rate)
+    return _build_sherpa(settings, speaker)
+
+
+def build_local_tts(settings: Settings, speaker: Speaker | None):
+    """按 TTS_BACKEND 选本地合成器：neural | nano | say。"""
+    backend = (settings.tts_backend or "say").lower()
+    if backend in ("nano", "nano-tts", "moss-nano"):
+        from .tts_nano import NanoTTS, probe_nano
+
+        if not probe_nano(settings.tts_nano_url):
+            print("⚠️  nano 侧车未就绪，回落本地 VITS（先 ./scripts/nano_tts_server.sh start --bg）", file=sys.stderr)
+            return _build_sherpa(settings, speaker)
+        return NanoTTS(
+            base_url=settings.tts_nano_url,
+            ref=settings.tts_nano_ref_audio,
+            stream=settings.tts_nano_stream,
+            timeout=settings.tts_nano_timeout,
+            speed=settings.tts_nano_speed,
             speaker=speaker,
+            fallback=_build_fallback(settings, speaker),
             output_device=settings.output_device,
         )
+    if backend in ("neural", "sherpa", "vits"):
+        return _build_sherpa(settings, speaker)
     from .tts import SayTTS
 
     # 注入了 Speaker/EndpointSpeaker 就必须走 wav 通路，否则 say -direct 仍打本机喇叭

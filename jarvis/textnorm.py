@@ -162,8 +162,29 @@ def _latin_to_cn(word: str) -> str:
     return "".join(_LETTER_CN.get(ch, ch) for ch in key)
 
 
-def normalize_for_tts(text: str) -> str:
-    """把文本里会被 TTS 丢掉的阿拉伯数字、拉丁词换成中文读法。"""
+def clean_for_speech(text: str) -> str:
+    """给多语种 TTS（Nano 等）用的薄清洗：去掉 markdown / emoji，保留中英文原词。"""
+    if not text:
+        return ""
+    out = text.strip()
+    out = re.sub(r"[*_`#~>]", "", out)
+    out = re.sub(r"!\[[^\]]*\]\([^)]*\)", "", out)  # ![alt](url)
+    out = re.sub(r"\[([^\]]+)\]\([^)]*\)", r"\1", out)  # [text](url) → text
+    # 去掉大部分 emoji / 杂符号，保留常用中英文标点
+    out = re.sub(
+        r"[\U0001F300-\U0001FAFF\U00002700-\U000027BF\U0001F000-\U0001F0FF]",
+        "",
+        out,
+    )
+    out = re.sub(r"[ \t]{2,}", " ", out)
+    return out.strip()
+
+
+def normalize_for_tts(text: str, *, numbers: bool = True, latin: bool = True) -> str:
+    """把文本里会被 TTS 丢掉的阿拉伯数字、拉丁词换成中文读法。
+
+    Nano 等多语种后端应 latin=False（或根本不调用），否则 tiger 会被念成「泰格」。
+    """
     if not text:
         return ""
     out = text.strip()
@@ -178,15 +199,17 @@ def normalize_for_tts(text: str) -> str:
         )
     )
 
-    # 顺序很重要：先处理复合语义（百分比/时间/年月日/温度），最后才处理裸数字
-    out = _TEMP.sub(lambda m: _number_to_cn(m.group(1)) + _CELSIUS, out)
-    out = _PERCENT.sub(lambda m: "百分之" + _number_to_cn(m.group(1)), out)
-    out = _TIME.sub(
-        lambda m: _number_to_cn(m.group(1)) + "点" + (_number_to_cn(m.group(2)) if m.group(2) != "00" else "整"),
-        out,
-    )
-    out = _YEAR.sub(lambda m: _digits_to_cn(m.group(1)) + "年", out)
-    out = _MONTH_DAY.sub(lambda m: _number_to_cn(m.group(1)) + m.group(2), out)
-    out = _NUMBER.sub(lambda m: _number_to_cn(m.group(0)), out)
-    out = _LATIN_WORD.sub(lambda m: _latin_to_cn(m.group(0)), out)
+    if numbers:
+        # 顺序很重要：先处理复合语义（百分比/时间/年月日/温度），最后才处理裸数字
+        out = _TEMP.sub(lambda m: _number_to_cn(m.group(1)) + _CELSIUS, out)
+        out = _PERCENT.sub(lambda m: "百分之" + _number_to_cn(m.group(1)), out)
+        out = _TIME.sub(
+            lambda m: _number_to_cn(m.group(1)) + "点" + (_number_to_cn(m.group(2)) if m.group(2) != "00" else "整"),
+            out,
+        )
+        out = _YEAR.sub(lambda m: _digits_to_cn(m.group(1)) + "年", out)
+        out = _MONTH_DAY.sub(lambda m: _number_to_cn(m.group(1)) + m.group(2), out)
+        out = _NUMBER.sub(lambda m: _number_to_cn(m.group(0)), out)
+    if latin:
+        out = _LATIN_WORD.sub(lambda m: _latin_to_cn(m.group(0)), out)
     return out

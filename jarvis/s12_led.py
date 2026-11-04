@@ -37,7 +37,7 @@ class S12Led:
     def __init__(
         self,
         host: str,
-        port: int = 8767,  # 兼容旧配置，未使用
+        port: int = 8767,  # 历史遗留：本类走 SSH，不监听任何端口
         *,
         enabled: bool = True,
         user: str = "root",

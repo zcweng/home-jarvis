@@ -38,6 +38,7 @@ run "打断检测"            $PY scripts/selftest_bargein.py
 run "唤醒词 + 首句先出声"  $PY scripts/selftest_wake.py
 run "语音输出路由"        $PY scripts/selftest_output.py
 run "TTS 数字归一化"      $PY scripts/selftest_tts_text.py
+run "Nano TTS 侧车"       $PY scripts/selftest_nano_tts.py
 run "KWS 专用唤醒词"      $PY scripts/selftest_kws.py
 run "设备工具层"          $PY scripts/selftest_tools.py
 

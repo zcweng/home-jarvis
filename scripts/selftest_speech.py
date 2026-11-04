@@ -44,6 +44,7 @@ CASES = [
     ("帮我把灯调暗一点，然后放点轻音乐", "多意图 + 指代"),
     ("明天成都天气怎么样", "问答"),
     ("客厅的灯已经打开了", "状态回报"),
+    ("老虎英文是 tiger", "中英混读"),
 ]
 
 
@@ -123,7 +124,35 @@ def main() -> int:
     print(f"平均 CER {avg_cer:.3f} · 平均 ASR {avg_asr:.0f}ms · 合成冷启动 {cold:.0f}ms · 缓存命中 {warm:.1f}ms")
     print(f"缓存目录：{tts._cache}")
 
-    ok = avg_cer <= 0.15
+    # 中英混读：macOS say 中文音色本身常念歪英文，这里只观察、不作为总闸门。
+    # Nano 侧车可用时另跑一条硬断言（真正会念英文的后端）。
+    for _ref, hyp, tag, *_rest in rows:
+        if tag != "中英混读":
+            continue
+        kept = ("tiger" in hyp.lower()) or ("泰格" in hyp)
+        print(f"混读（say）：{'✅' if kept else '⚠️  say 未保留英文（预期可能失败）'} hyp={hyp!r}")
+
+    nano_mix_ok = True
+    from jarvis.tts_nano import NanoTTS, probe_nano  # noqa: PLC0415
+
+    if probe_nano(st.tts_nano_url):
+        import soxr  # noqa: PLC0415
+
+        nano = NanoTTS(st.tts_nano_url, ref=Path(st.tts_nano_ref_audio).stem, timeout=30)
+        pcm_n, sr_n = nano.synthesize("老虎英文是 tiger")
+        pcm16 = soxr.resample(pcm_n.astype("float32"), sr_n, 16000)
+        hyp_n, _ = asr.transcribe(pcm16)
+        nano_mix_ok = "tiger" in hyp_n.lower()
+        print(f"混读（nano）：{'✅' if nano_mix_ok else '❌'} hyp={hyp_n!r}")
+    else:
+        print("混读（nano）：⏭️  侧车未就绪，跳过硬断言")
+
+    # say 路径平均 CER 不含「故意念歪英文」的干扰：混读句从均值里剔除再判一次
+    base_rows = [r for r in rows if r[2] != "中英混读"]
+    avg_cer_base = sum(r[3] for r in base_rows) / max(1, len(base_rows))
+    print(f"平均 CER（不含混读） {avg_cer_base:.3f}")
+
+    ok = avg_cer_base <= 0.15 and nano_mix_ok
 
     if args.mic > 0:
         print(f"\n== 真麦克风 {args.mic:g}s ==")

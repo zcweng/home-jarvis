@@ -9,9 +9,12 @@ WITH_VOL=0
 SSH="ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o BatchMode=yes -o ConnectTimeout=5 -o HostKeyAlgorithms=+ssh-rsa -o PubkeyAcceptedKeyTypes=+ssh-rsa root@$HOST"
 ROOT=$(CDPATH= cd -- "$(dirname "$0")/../.." && pwd)
 
+# 旧版 ledd.sh（FIFO 守护）已从仓库删除：灯环只有一条实现，就是
+# led-set.sh + volumed 的本地画灯。设备上若还跑着上一版留下的 ledd，
+# 这里顺手清掉（只做一次性迁移，不再安装任何 FIFO 守护）。
 $SSH 'export PATH=/usr/sbin:/usr/bin:/sbin:/bin
 for p in $(ps w | grep -E "jarvis-ledd|jarvis-led-breath" | grep -v grep | awk "{print \$1}"); do kill $p 2>/dev/null; done
-rm -f /tmp/jarvis-ledd.pid /tmp/jarvis-led.fifo
+rm -f /tmp/jarvis-ledd.pid /tmp/jarvis-led.fifo /data/jarvis-ledd.sh
 '
 
 cat "$ROOT/tools/s12led/led-set.sh" | $SSH 'export PATH=/usr/sbin:/usr/bin:/sbin:/bin; /bin/cat > /data/jarvis-led-set.sh && chmod +x /data/jarvis-led-set.sh && ls -l /data/jarvis-led-set.sh'

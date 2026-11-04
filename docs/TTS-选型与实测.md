@@ -47,6 +47,9 @@ SAY_RATE=170            # 原默认 175 偏快；降到 170 明显松弛
 | macOS `say`（改造后） | **482~789ms** | 24kHz | ⭐⭐ 拼出来的 | 无 | 0 |
 | 本地 VITS · aishell3 | **96~187ms** | 8kHz ⚠️ 发闷 | ⭐⭐⭐ 韵律自然 | 无 | 0 |
 | **本地 VITS · fanchen-C**（当前默认） | 496ms / 13字 · 1019ms / 25字 | 16kHz | ⭐⭐⭐⭐ | 无 | 0 |
+| **MOSS-TTS-Nano ONNX（侧车，zh_1）** | 句级 ~950ms / 13字 · 流式首包 ~80ms · RTF≈0.35 | 48kHz | ⭐⭐⭐⭐ 中英混读不丢词 | 无 | 0（CPU ~2.4GB） |
+
+Nano 接入说明见 `docs/接入Nano-TTS改造计划.md`。默认仍用 VITS；切 `TTS_BACKEND=nano` 前需侧车常驻。
 
 ### 语速（`TTS_SPEED`）
 

@@ -10,12 +10,30 @@
 //   2. 硬件只播 index 1（右声道）→ 播放必须把 mono 复制到左右两声道
 //   3. 采集只能 8ch（-c6/-c1 报 Channels count non available）
 //
+// 2026-11-04 设备实测（pns 停掉后 /data/probe_rate、/data/probe_stream）：
+//   · hw:0,0 采集与播放都接受 16000 精确赋值（set_rate rc=0 → 16000），
+//     **16k 直采成立**，不需要 48k→16k 重采样。所以下面用 set_rate 而非
+//     set_rate_near，并对回填值做硬断言 —— 一旦哪天固件变了会立刻报错退出，
+//     而不是带着 3 倍错位的时间戳继续跑。
+//   · 8ch S32 @16k 的 period_size=160 合法，但 buffer 被 ALSA 钳到 128 帧
+//     （8ms）；128 不是 160 的整数倍 → readi 会返回小于一帧的短读。
+//     旧实现把 got 累加到 160 就当作整帧，于是每帧悄悄混进了上一帧的尾部，
+//     留下周期性不连续 —— 这就是 AEC 永远收敛不到 20dB 的第二个原因。
+//     现在采集端一律按「攒满 160 帧」处理，不会再错。
+//   · ch0-5 直流约 -5%FS、语音 RMS 约 -54dBFS；ch6 恒 0；ch7 空闲时精确 0。
+//
 // 重要：设备上 libspeexdsp 1.2-rc1 是**定点**版，echo/preprocess 全部用 spx_int16_t。
 // 所以内部处理链一律 S16，不转 float —— 既符合库接口，又比 float 省 CPU。
 //
-// 线程模型：
-//   capture  → cap_ring(8ch S16) → process(解交织+HPF+AEC+NS+选路) → up_ring → uplink
+// 线程模型与**资源所有权**（每个可变状态只有一个线程写，这是并发正确性的地基）：
+//   capture  → cap_ring(8ch S16) → process(解交织+DC+AEC+NS+选路) → up_ring → uplink
 //   downlink → play_ring(mono S16) → playback → ALSA
+//
+//   g_pcm_cap   只被 capture 线程使用
+//   g_pcm_play  只被 playback 线程使用（downlink 通过 g_flush_req 请求，不再直接碰句柄）
+//   g_vol_pct   只被 playback 线程写（它也是 /tmp/jarvis-vol.pct 的唯一写者）
+//   g_mic_muted 只被 playback 线程轮询后写；uplink 只读
+//   g_mic_mute_seen 只被 playback 线程读写（旧实现被两个线程同时调用，见 2026-11-04 审查）
 // ===========================================================================
 
 #define _GNU_SOURCE
@@ -40,8 +58,13 @@
 #include <time.h>
 #include <unistd.h>
 
-#include "vol_dong_pcm.h"
+#include "gain.h"
+#include "proto.h"
+#include "ring.h"
+#include "state_file.h"
+
 #include "mute_sfx_pcm.h"
+#include "vol_dong_pcm.h"
 
 // --------------------------------------------------------------------------- 常量
 
@@ -56,25 +79,28 @@
 
 #define AEC_FILTER_LEN 3200 /* 200ms @16k，speex 要求是 16 的倍数 */
 
-#define HPF_CUTOFF_HZ 80.0
+/* DC 阻断：一阶 IIR，跟随 ~2Hz 直流/温漂，不碰语音低频。
+ * 断点 80Hz 的二阶巴特沃斯在文档 §4.3 里写过，但实测直流是**常量**偏置
+ * （-5%FS 且 1s 内几乎不变），一阶足够且不会在 80Hz 处引入相位旋转。 */
+#define DC_TRACK_COEF 0.0005
+
+#define HPF_CUTOFF_HZ 80.0 /* 仅保留给文档对齐，见上 */
 
 #define UP_PORT 8765
 #define DOWN_PORT 8766
 
-#define PLAY_PREBUF 3 /* 起播前攒 30ms */
+#define PLAY_PREBUF 3       /* 起播前攒 30ms */
 #define PLAY_RING_FRAMES 300 /* 3s@10ms：抗住客户端短时突发，避免挤掉开头 */
+#define UP_RING_FRAMES 100   /* 1s：Mac 侧偶发卡顿不再静默丢帧（旧值 16 帧=160ms） */
 
-#define F_PCM 1
-#define F_FLUSH 2
-#define F_VOLUME 3
-#define F_PING 4
+/* 参考延迟：**0**。
+ * 2026-11-04 设备实测（/data/bench_aec，自放自录，逐通道固定选路）：
+ *   ref 延迟   0样本/32/80/160    →  新AEC ERLE 平均 5.2 / 5.1 / 0.5 / 0.3 dB
+ * ch7 与麦克风在同一个 ALSA 帧里，mic 听到的就是**本帧**写入 DAC 的样本，
+ * 所以同帧喂 ref 才是对的。加 5ms 以上延迟立刻崩到噪声级（0.2~0.5dB）。
+ * 结论：不要引入参考延迟线。 */
 
-typedef struct __attribute__((packed)) {
-  uint8_t type;
-  uint8_t flags;
-  uint16_t reserved;
-  uint32_t length;
-} frame_hdr_t;
+#define VOL_MIN_PCT JARVIS_VOL_MIN_PCT
 
 // --------------------------------------------------------------------------- 全局
 
@@ -82,31 +108,47 @@ static volatile sig_atomic_t g_stop = 0;
 static int g_verbose = 1;
 
 /* 2026-11-02 重标定：噪声底 ≈ -84 dBFS，正常说话峰值 ≈ -53 dBFS（ch3 最佳）。
-   目标说话后置 -18 dBFS → gain≈53；取 56 留一点余量。
-   旧值 265（+48dB）是把噪声底误当成语音，导致噪声抬到 -35dBFS 且大量削顶。 */
-static double g_gain_mic = 56.0;
+ *
+ * 2026-11-04 设备实测（/data/bench_aec_g，自放自录逐通道 ERLE）证明**固定数字增益
+ * 是 AEC 成败的一号因素**，因为 Speex 定点版一旦饱和就冻结自适应：
+ *
+ *   增益    mic 电平      6-state AEC 平均 ERLE
+ *   56     -7~-12 dBFS   **2.3 dB**   ← 削顶，AEC 基本失效
+ *   32     -15~-20 dBFS    4.8 dB
+ *   20     -21~-25 dBFS    8.6 dB
+ *   14     -27~-31 dBFS   11.1 dB
+ *   6      -44~-50 dBFS   11.1 dB     ← 不再提升，说明 11dB 是算法/扬声器上限
+ *
+ * 所以默认取 20：避开饱和，同时保留足够电平给 ASR（-25dBFS 对 16bit 完全够用）。
+ * 如果 ASR 需要更响，**用 -p（后置增益）在 AEC 之后补**，不要调这个值。
+ *
+ * 饱和阈值不在 32767，而在「预加重之后」。mdf.c 对每个样本先做
+ *   tmp32 = x[n] - 0.9*x[n-1]        // preemph = QCONST16(.9,15)
+ * 再判 tmp32 是否越界，所以高频分量最多被放大 ~1.9 倍 —— 原始峰值到 17k LSB
+ * 附近就可能触发。近端饱和冻结 1 帧（10ms），**参考饱和冻结 M+1 帧**；
+ * 本项目 filter_len=3200 / frame=160 → M=21，即一次 ref 裁剪要停学 220ms。
+ * 这就是 ch7 必须单位增益、不加任何滤波的原因。 */
+static double g_gain_mic = 20.0;
 static int g_select_mode = 0; /* 0=自适应 1=固定 2=平均 */
 static int g_fixed_ch = 0;
 static int g_aec_on = 1;
 static int g_ns_on = 1;
 static int g_agc_on = 0;
 static int g_gain_post_db = 0;
-static double g_vol = 1.0;
-static int g_vol_pct = -1; /* -1=尚未同步；播放线程轮询 /tmp/jarvis-vol.pct */
 static volatile int g_mic_muted = 0;
-#define VOL_PCT_FILE "/tmp/jarvis-vol.pct"
-#define MUTE_FILE "/tmp/jarvis-mic.mute"
-#define VOL_MIN_PCT 5
 
-static unsigned long g_upsent_drop;
-static unsigned long g_frames, g_upsent, g_downframes, g_flushes, g_overflows;
+static unsigned long g_frames, g_upsent, g_upsent_drop, g_downframes, g_flushes;
 static unsigned long g_cap_frames;
 static volatile unsigned long g_hb_proc, g_hb_up, g_hb_play, g_hb_cap;
-static volatile sig_atomic_t g_do_probe = 0;
+static volatile sig_atomic_t g_stats_req = 0;
+static volatile sig_atomic_t g_probe_req = 0;
 static unsigned long g_clip = 0;
 static double g_erle = 0, g_erle_sum = 0;
 static unsigned long g_erle_n = 0;
 static int g_sel_ch = 0;
+static int g_rate_ok = 1;
+
+// --------------------------------------------------------------------------- 日志 / 信号
 
 static void logf_(const char *fmt, ...) {
   if (!g_verbose) return;
@@ -123,37 +165,44 @@ static void logf_(const char *fmt, ...) {
   fputc('\n', stderr);
 }
 
+/* 信号处理函数里只置标志 / write()。
+ * 旧实现在 SIGUSR1 里直接 fprintf + localtime_r（stdio 锁 + tz 锁），
+ * 一旦信号落在主线程持锁期间就会自死锁，现象是「发 SIGUSR1 就卡住」。
+ * 现在 SIGUSR1 写一个字节到自管道，main 的事件循环负责真正打印。 */
+static int g_sig_pipe[2] = {-1, -1};
+
 static void on_signal(int s) {
   (void)s;
   g_stop = 1;
 }
 
-static void probe_channels(void);
-
-static void dump_stats(void) {
-  double erle_avg = g_erle_n ? g_erle_sum / g_erle_n : 0;
-  logf_("STATS cap=%lu frames=%lu up=%lu drop=%lu down=%lu flush=%lu ovf=%lu clip=%lu sel=%d erle=%.1f/%.1f hb[%lu/%lu/%lu/%lu]",
-        g_cap_frames, g_frames, g_upsent, g_upsent_drop, g_downframes, g_flushes, g_overflows, g_clip,
-        g_sel_ch, erle_avg, g_erle, g_hb_cap, g_hb_proc, g_hb_up, g_hb_play);
-}
-
 static void on_usr1(int s) {
   (void)s;
-  dump_stats();
+  char c = 'S';
+  if (g_sig_pipe[1] >= 0) {
+    ssize_t n = write(g_sig_pipe[1], &c, 1);
+    (void)n;
+  }
 }
 
 static void on_usr2(int s) {
   (void)s;
-  g_do_probe = 1;
+  char c = 'P';
+  if (g_sig_pipe[1] >= 0) {
+    ssize_t n = write(g_sig_pipe[1], &c, 1);
+    (void)n;
+  }
 }
 
+// --------------------------------------------------------------------------- 电平
+
 static double dbfs_s16(const int16_t *x, int n) {
+  if (n <= 0) return -120.0;
   double s = 0;
   for (int i = 0; i < n; i++) {
     double v = x[i] / 32768.0;
     s += v * v;
   }
-  if (n <= 0) return -120.0;
   double r = sqrt(s / n);
   return r <= 1e-9 ? -120.0 : 20.0 * log10(r);
 }
@@ -188,103 +237,6 @@ static void probe_channels(void) {
   }
 }
 
-// --------------------------------------------------------------------------- 环形缓冲（S16）
-
-typedef struct {
-  int16_t *buf;
-  int cap;
-  int rd;
-  int wr;
-  int count; /* 当前有效样本数，避免用指针差值推算（覆盖时会算成负数） */
-  pthread_mutex_t m;
-  pthread_cond_t c;
-} ring_t;
-
-static int ring_init(ring_t *r, int cap) {
-  r->buf = calloc(cap, sizeof(int16_t));
-  if (!r->buf) return -1;
-  r->cap = cap;
-  r->rd = r->wr = 0;
-  r->count = 0;
-  pthread_mutex_init(&r->m, NULL);
-  pthread_cond_init(&r->c, NULL);
-  return 0;
-}
-
-static void ring_free(ring_t *r) {
-  free(r->buf);
-  pthread_mutex_destroy(&r->m);
-  pthread_cond_destroy(&r->c);
-}
-
-static void ring_clear(ring_t *r) {
-  pthread_mutex_lock(&r->m);
-  r->rd = r->wr = 0;
-  r->count = 0;
-  pthread_cond_signal(&r->c);
-  pthread_mutex_unlock(&r->m);
-}
-
-static int ring_avail(ring_t *r) {
-  pthread_mutex_lock(&r->m);
-  int n = r->count;
-  pthread_mutex_unlock(&r->m);
-  return n;
-}
-
-static void ring_write(ring_t *r, const int16_t *x, int n) {
-  pthread_mutex_lock(&r->m);
-  for (int i = 0; i < n; i++) {
-    if (r->count >= r->cap) { /* 满：丢最旧一个 */
-      r->rd = (r->rd + 1) % r->cap;
-      r->count--;
-      g_overflows++;
-    }
-    r->buf[r->wr] = x[i];
-    r->wr = (r->wr + 1) % r->cap;
-    r->count++;
-  }
-  pthread_cond_signal(&r->c);
-  pthread_mutex_unlock(&r->m);
-}
-
-// 读满 n 个样本；超时返回实际读到的。
-// 刻意不用条件变量：帧率只有 100Hz（10ms），10ms 级轮询的开销可忽略，
-// 但能彻底避免"丢失唤醒 → 永久阻塞"这类只在嵌入式老 glibc 上出现的坑。
-static int ring_read(ring_t *r, int16_t *x, int n, int timeout_ms) {
-  int deadline_us = timeout_ms * 1000;
-  int waited = 0;
-  int got = 0;
-  while (got < n && !g_stop) {
-    pthread_mutex_lock(&r->m);
-    int avail = r->count;
-    if (avail > 0) {
-      int take = n - got;
-      if (take > avail) take = avail;
-      int first = r->cap - r->rd;
-      if (first > take) first = take;
-      memcpy(x + got, r->buf + r->rd, (size_t)first * sizeof(int16_t));
-      r->rd = (r->rd + first) % r->cap;
-      r->count -= first;
-      got += first;
-      if (take > first) {
-        int rest = take - first;
-        memcpy(x + got, r->buf + r->rd, (size_t)rest * sizeof(int16_t));
-        r->rd = (r->rd + rest) % r->cap;
-        r->count -= rest;
-        got += rest;
-      }
-    }
-    pthread_mutex_unlock(&r->m);
-
-    if (got >= n) break;
-    if (waited >= deadline_us) break;
-    usleep(2000);
-    waited += 2000;
-  }
-  return got;
-}
-
 // --------------------------------------------------------------------------- 状态
 
 static snd_pcm_t *g_pcm_cap = NULL;
@@ -294,8 +246,15 @@ static ring_t g_cap_ring;  /* 8ch 交织 S16 */
 static ring_t g_up_ring;   /* mono S16 待上行 */
 static ring_t g_play_ring; /* mono S16 待播放 */
 
-static SpeexEchoState *g_echo = NULL;
+static SpeexEchoState *g_echo = NULL;          /* g_select_mode==2 时的单通道 state */
+static SpeexEchoState *g_echo_mic[MIC_CH];     /* 每路麦克风一个独立 state */
 static SpeexPreprocessState *g_pp = NULL;
+
+/* playback 线程写的状态；其它线程只读 */
+static int g_vol_pct = -1; /* -1=尚未同步。**唯一的音量真值** */
+static double g_vol = 1.0; /* 由 g_vol_pct 推导，不独立赋值 */
+static volatile int g_pending_vol_byte = -1; /* downlink 写、playback 消费 */
+static volatile int g_flush_req = 0; /* downlink 置位，playback 执行 */
 
 // --------------------------------------------------------------------------- 采集
 
@@ -310,6 +269,8 @@ static void *capture_thread(void *arg) {
 
   while (!g_stop) {
     int got = 0;
+    /* 攒满一帧。ALSA buffer 只有 128 帧、period 160，readi 必然短读，
+     * 所以这里必须能跨多次 readi 累积，按**帧**而不是按**样本**对齐。 */
     while (got < FRAME_SAMPLES && !g_stop) {
       int want = FRAME_SAMPLES - got;
       snd_pcm_sframes_t n = snd_pcm_readi(g_pcm_cap, raw + got * CAP_CH, want);
@@ -324,50 +285,54 @@ static void *capture_thread(void *arg) {
         usleep(2000);
         continue;
       }
-      // S32 → S16，同时扣直流 + 预放大
-      for (int i = 0; i < (int)n; i++) {
-        for (int c = 0; c < CAP_CH; c++) {
-          int idx = (got + i) * CAP_CH + c;
-          if (c < MIC_CH) {
-            double v = raw[idx];
-            if (dc_init) {
-              dc[c] += (v - dc[c]) * 0.0005;
-            } else {
-              dc[c] += v / FRAME_SAMPLES; /* 首帧取均值作初值 */
-            }
-            /* int32 → int16：先归一到 [-1,1) 再乘增益。
-               直接把 int32 值乘增益再截断是错的 —— int32 满量程 2^31
-               对应 S16 的 32768，中间差 65536 倍，会全量削顶。 */
-            double s = (v - dc[c]) / 65536.0 * g_gain_mic;
-            if (s > 32767.0) {
-              s = 32767.0;
-              g_clip++;
-            }
-            if (s < -32768.0) {
-              s = -32768.0;
-              g_clip++;
-            }
-            tmp[idx] = (int16_t)s;
-          } else {
-            // ch6 恒 0；ch7 是数字环回，按 16 位取高位，不做任何处理
-            tmp[idx] = (int16_t)(raw[idx] >> 16);
-          }
-        }
-      }
+      if (n == 0) continue;
+      if ((int)n > want) n = want; /* 防御：不该发生，但别越界 */
       got += (int)n;
     }
-    if (got == FRAME_SAMPLES) {
-      if (!dc_init) {
-        logf_("DC init: %.0f %.0f %.0f %.0f %.0f %.0f", dc[0], dc[1], dc[2], dc[3], dc[4], dc[5]);
+    if (got < FRAME_SAMPLES) break;
+
+    // S32 → S16，同时扣直流 + 预放大
+    for (int i = 0; i < FRAME_SAMPLES; i++) {
+      for (int c = 0; c < CAP_CH; c++) {
+        int idx = i * CAP_CH + c;
+        if (c < MIC_CH) {
+          double v = raw[idx];
+          if (dc_init) {
+            dc[c] += (v - dc[c]) * DC_TRACK_COEF;
+          } else {
+            dc[c] += v / FRAME_SAMPLES; /* 首帧取均值作初值 */
+          }
+          /* int32 → int16：先归一到 [-1,1) 再乘增益。
+             直接把 int32 值乘增益再截断是错的 —— int32 满量程 2^31
+             对应 S16 的 32768，中间差 65536 倍，会全量削顶。 */
+          double s = (v - dc[c]) / 65536.0 * g_gain_mic;
+          if (s > 32767.0) {
+            s = 32767.0;
+            g_clip++;
+          }
+          if (s < -32768.0) {
+            s = -32768.0;
+            g_clip++;
+          }
+          tmp[idx] = (int16_t)s;
+        } else {
+          // ch6 恒 0；ch7 是数字环回，按 16 位取高位，不做任何处理
+          // （不给 ref 加增益、不过滤波器：它是 DAC 前的**精确**样本，
+          //   任何额外处理都会破坏「ref == 写入的 PCM」这个不变量）
+          tmp[idx] = (int16_t)(raw[idx] >> 16);
+        }
       }
+    }
+    if (!dc_init) {
+      logf_("DC init: %.0f %.0f %.0f %.0f %.0f %.0f", dc[0], dc[1], dc[2], dc[3], dc[4], dc[5]);
       dc_init = 1;
-      ring_write(&g_cap_ring, tmp, FRAME_SAMPLES * CAP_CH);
-      g_cap_frames++;
-      g_hb_cap++;
-      if ((g_cap_frames & 15) == 0) { /* 每 160ms 刷新一次诊断快照 */
-        memcpy(g_probe_snap, raw, sizeof(g_probe_snap));
-        g_probe_ready = 1;
-      }
+    }
+    ring_write(&g_cap_ring, tmp, FRAME_SAMPLES * CAP_CH);
+    g_cap_frames++;
+    g_hb_cap++;
+    if ((g_cap_frames & 15) == 0) { /* 每 160ms 刷新一次诊断快照 */
+      memcpy(g_probe_snap, raw, sizeof(g_probe_snap));
+      g_probe_ready = 1;
     }
   }
   return NULL;
@@ -375,12 +340,33 @@ static void *capture_thread(void *arg) {
 
 // --------------------------------------------------------------------------- 处理
 
+/* 选路：按（可选 post-AEC）能量挑一路。抽成函数，避免两条路径各抄一遍。 */
+static int pick_loudest(int16_t x[][FRAME_SAMPLES]) {
+  if (g_select_mode == 1) return g_fixed_ch;
+  int best = 0;
+  double bv = -1;
+  for (int c = 0; c < MIC_CH; c++) {
+    double p = 0;
+    for (int i = 0; i < FRAME_SAMPLES; i++) p += (double)x[c][i] * x[c][i];
+    if (p > bv) {
+      bv = p;
+      best = c;
+    }
+  }
+  return best;
+}
+
+/* 自动选路必须在**消回声之前**做。
+ * 之前按 AEC 输出能量选，等于偏向「这路没消干净」—— 消得好的通道被静音、
+ * 消得差的通道被选中，上行里剩的就是残留回声。按输入能量选则偏向「离人近」，
+ * 与回声抑制无关。固定通道（-c）仍然优先。 */
+
 static void *process_thread(void *arg) {
   (void)arg;
   static int16_t in[FRAME_SAMPLES * CAP_CH];
   static int16_t near[MIC_CH][FRAME_SAMPLES];
   static int16_t refv[FRAME_SAMPLES];
-  static int16_t ref_avg[FRAME_SAMPLES];
+  static int16_t avg_in[FRAME_SAMPLES];
   static int16_t cancel[MIC_CH][FRAME_SAMPLES];
   int16_t out[FRAME_SAMPLES];
 
@@ -388,7 +374,9 @@ static void *process_thread(void *arg) {
     g_hb_proc++;
     int got = ring_read(&g_cap_ring, in, FRAME_SAMPLES * CAP_CH, 200);
     if (got < FRAME_SAMPLES * CAP_CH) {
-      if ((g_hb_proc & 63) == 63) logf_("proc短路 got=%d/%d avail=%d", got, FRAME_SAMPLES * CAP_CH, ring_avail(&g_cap_ring));
+      if ((g_hb_proc & 63) == 63)
+        logf_("proc 短路 got=%d/%d avail=%d", got, FRAME_SAMPLES * CAP_CH,
+              ring_avail(&g_cap_ring));
       usleep(1000);
       continue;
     }
@@ -400,16 +388,26 @@ static void *process_thread(void *arg) {
     for (int i = 0; i < FRAME_SAMPLES; i++) refv[i] = in[i * CAP_CH + REF_CH];
 
     // ② AEC + 选路
-    if (g_aec_on && g_echo) {
+    //
+    // ⚠️ 这里必须用 **MIC_CH 个独立 state**，不能用一个 state 循环调 6 次：
+    //    speex_echo_cancellation 每次调用都会推进 st->x（参考延迟线）、
+    //    更新同一组 W、并刷新 st->last_y，所以「一帧调 6 次」等于把延迟线
+    //    推进了 6 帧、并让系数在 6 条不同回声路径之间来回拉扯 —— 不可能收敛。
+    //    也不能用 init_mc：MC 版所有 mic 共享同一组自适应系数，而 6 只麦到
+    //    喇叭的距离/房间响应各不相同。设备实测（自放自录，逐通道）：
+    //        旧(1 state×6) 2.7dB  |  init_mc 0.6dB  |  6 个独立 state 5.2dB
+    //    代价是多 5 次 far_end FFT —— 在 4×A53 上可接受，正确性优先。
+    //    参考信号同帧喂入（ref 延迟实测必须为 0，见 AEC_REF_DELAY 注释）。
+    if (g_aec_on && (g_echo || g_echo_mic[0])) {
       if (g_select_mode == 2) {
-        // 六路平均后单通道 AEC（注意：out 同时作输入和输出在 speex 里不安全，用独立缓冲）
+        // 六路平均后单通道 AEC（省 CPU）
         for (int i = 0; i < FRAME_SAMPLES; i++) {
           int acc = 0;
           for (int c = 0; c < MIC_CH; c++) acc += near[c][i];
-          ref_avg[i] = (int16_t)(acc / MIC_CH);
+          avg_in[i] = (int16_t)(acc / MIC_CH);
         }
         int16_t raw_in[FRAME_SAMPLES];
-        memcpy(raw_in, ref_avg, sizeof(raw_in));
+        memcpy(raw_in, avg_in, sizeof(raw_in));
         speex_echo_cancellation(g_echo, raw_in, refv, out);
         g_sel_ch = -1;
         double in_db = dbfs_s16(raw_in, FRAME_SAMPLES);
@@ -420,48 +418,29 @@ static void *process_thread(void *arg) {
           g_erle_n++;
         }
       } else {
-        // 多通道：各自 AEC，选取后能量最大的一路
-        for (int c = 0; c < MIC_CH; c++) speex_echo_cancellation(g_echo, near[c], refv, cancel[c]);
-        int best = 0;
-        if (g_select_mode == 1) {
-          best = g_fixed_ch;
-        } else {
-          double bv = -1;
-          for (int c = 0; c < MIC_CH; c++) {
-            double p = 0;
-            for (int i = 0; i < FRAME_SAMPLES; i++) p += (double)cancel[c][i] * cancel[c][i];
-            if (p > bv) {
-              bv = p;
-              best = c;
-            }
-          }
+        // 多通道：各自独立 AEC，选取后能量最大的一路。
+        // state 与通道一一对应 —— 每个通道必须始终喂给同一个 state，
+        // 否则等于重新收敛。g_echo_mic[c] 保证了这个绑定。
+        for (int c = 0; c < MIC_CH; c++) {
+          speex_echo_cancellation(g_echo_mic[c], near[c], refv, cancel[c]);
         }
+        int best = pick_loudest(near); /* 按输入能量选，见 pick_loudest 上方注释 */
         g_sel_ch = best;
         memcpy(out, cancel[best], sizeof(out));
 
+        /* ERLE 按「同一路 mic 前后」算，不能跨通道。
+         * 旧实现用 near[best_new] 比 out[best_new]，而 best 每帧都可能变，
+         * 于是 3.9dB 这种数字既不是 ch3 的也不是 ch4 的，无法用来判断收敛。 */
         double in_db = dbfs_s16(near[best], FRAME_SAMPLES);
-        double out_db = dbfs_s16(out, FRAME_SAMPLES);
-        if (in_db > -70.0) {
+        double out_db = dbfs_s16(cancel[best], FRAME_SAMPLES);
+        if (in_db > -70.0) { /* 只在有信号时统计，静音段 ERLE 无意义 */
           g_erle = in_db - out_db;
           g_erle_sum += g_erle;
           g_erle_n++;
         }
       }
     } else {
-      int best = 0;
-      if (g_select_mode == 1) {
-        best = g_fixed_ch;
-      } else {
-        double bv = -1;
-        for (int c = 0; c < MIC_CH; c++) {
-          double p = 0;
-          for (int i = 0; i < FRAME_SAMPLES; i++) p += (double)near[c][i] * near[c][i];
-          if (p > bv) {
-            bv = p;
-            best = c;
-          }
-        }
-      }
+      int best = pick_loudest(near);
       g_sel_ch = best;
       memcpy(out, near[best], sizeof(out));
     }
@@ -506,7 +485,7 @@ static int tcp_listen(int port) {
   return fd;
 }
 
-static void set_nodelay(int fd) {
+static void set_send_timeout(int fd) {
   int one = 1;
   setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
   /* send 必须带超时：否则客户端读得慢（或断开未被探测）时，
@@ -517,41 +496,103 @@ static void set_nodelay(int fd) {
   setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
 }
 
-static void mute_poll_file(void); /* 定义见音效段：边沿触发 Bottle/Funk */
+/* 整帧写满。旧实现把 send 的部分写当作成功，下一帧从字节流中间接上，
+ * 之后所有 PCM 永久错位半个样本 —— 听感是持续爆音，且极难定位。 */
+static int send_all(int fd, const void *buf, size_t len) {
+  const char *p = (const char *)buf;
+  size_t off = 0;
+  while (off < len) {
+    ssize_t n = send(fd, p + off, len - off, MSG_NOSIGNAL);
+    if (n < 0) {
+      if (errno == EINTR) continue;
+      if (errno == EAGAIN || errno == EWOULDBLOCK) return 0; /* 整帧丢弃 */
+      return -1;
+    }
+    if (n == 0) return -1;
+    off += (size_t)n;
+  }
+  return 1;
+}
 
 static void *uplink_thread(void *arg) {
   int lfd = *(int *)arg;
+  static int16_t blk[FRAME_SAMPLES];
   while (!g_stop) {
     struct pollfd p = {lfd, POLLIN, 0};
     if (poll(&p, 1, 200) <= 0) continue;
     int cfd = accept(lfd, NULL, NULL);
     if (cfd < 0) continue;
-    set_nodelay(cfd);
+    set_send_timeout(cfd);
     logf_("上行已连接");
     ring_clear(&g_up_ring);
 
-    static int16_t blk[FRAME_SAMPLES];
     while (!g_stop) {
       g_hb_up++;
-      mute_poll_file();
       int got = ring_read(&g_up_ring, blk, FRAME_SAMPLES, 200);
       if (got < FRAME_SAMPLES) continue;
       if (g_mic_muted) memset(blk, 0, sizeof(blk));
-      ssize_t n = send(cfd, blk, FRAME_BYTES_S16, MSG_NOSIGNAL);
-      if (n < 0) {
-        if (errno == EAGAIN || errno == EWOULDBLOCK) {
-          g_upsent_drop++; /* 客户端跟不上，丢这一帧，不阻塞 */
-          continue;
-        }
-        break;
+      int r = send_all(cfd, blk, FRAME_BYTES_S16);
+      if (r < 0) break;
+      if (r == 0) {
+        g_upsent_drop++; /* 客户端跟不上，丢这一帧，不阻塞 */
+        continue;
       }
-      if (n == 0) break;
       g_upsent++;
     }
     close(cfd);
     logf_("上行断开，等待重连");
   }
   return NULL;
+}
+
+/* 下行会话：解析帧 → 写 play_ring / 请求 FLUSH / 更新音量。
+ * 这里**不碰** g_pcm_play，所有 ALSA 操作归 playback 线程（见文件头所有权表）。 */
+static void downlink_session(int cfd, char **payload_buf, size_t *payload_cap) {
+  for (;;) {
+    frame_hdr_t h;
+    io_result_t r = io_read_full(cfd, &h, sizeof(h), &g_stop, 300);
+    if (r == IO_TIMEOUT) continue;
+    if (r != IO_OK) return;
+
+    uint32_t len = hdr_get_length(&h);
+    if (len > PROTO_MAX_PAYLOAD) {
+      logf_("下行帧长度非法 %u，断开重连", len);
+      return;
+    }
+    if (len > *payload_cap) {
+      char *np = (char *)realloc(*payload_buf, len);
+      if (!np) return;
+      *payload_buf = np;
+      *payload_cap = len;
+    }
+    if (len > 0) {
+      r = io_read_full(cfd, *payload_buf, len, &g_stop, 1000);
+      if (r != IO_OK) return;
+    }
+
+    if (h.type == F_PCM) {
+      int ns = (int)(len / 2);
+      int16_t *p16 = (int16_t *)*payload_buf;
+      /* 这里只做「解析并入 ring」。用户音量统一在 playback 线程施加，
+         保证输出信号链只归一个线程管（也避免跨线程读 double g_vol）。 */
+      ring_write(&g_play_ring, p16, ns);
+      g_downframes++;
+    } else if (h.type == F_FLUSH) {
+      ring_clear(&g_play_ring);
+      g_flush_req = 1; /* 交给 playback 线程去 drop+prepare */
+      g_flushes++;
+    } else if (h.type == F_VOLUME) {
+      if (len >= 1) {
+        /* F_VOLUME 字节是 Mac 侧的权威音量表达；转换成 pct 后交给
+           set_vol_pct_from_byte，由它统一更新 g_vol_pct / g_vol / pct 文件。 */
+        int byte = (unsigned char)(*payload_buf)[0];
+        g_pending_vol_byte = byte;
+      }
+    } else if (h.type == F_PING) {
+      ssize_t n = send(cfd, "PONG", 4, MSG_NOSIGNAL);
+      (void)n;
+    }
+  }
 }
 
 static void *downlink_thread(void *arg) {
@@ -564,58 +605,9 @@ static void *downlink_thread(void *arg) {
     if (poll(&p, 1, 200) <= 0) continue;
     int cfd = accept(lfd, NULL, NULL);
     if (cfd < 0) continue;
-    set_nodelay(cfd);
+    set_send_timeout(cfd);
     logf_("下行已连接");
-
-    while (!g_stop) {
-      frame_hdr_t h;
-      size_t got = 0;
-      while (got < sizeof(h)) {
-        ssize_t n = recv(cfd, ((char *)&h) + got, sizeof(h) - got, 0);
-        if (n <= 0) goto sess_done;
-        got += (size_t)n;
-      }
-      if (h.length > 1024u * 1024u) goto sess_done;
-      if (h.length > pcap) {
-        char *np = realloc(payload, h.length);
-        if (!np) goto sess_done;
-        payload = np;
-        pcap = h.length;
-      }
-      got = 0;
-      while (got < h.length) {
-        ssize_t n = recv(cfd, payload + got, h.length - got, 0);
-        if (n <= 0) goto sess_done;
-        got += (size_t)n;
-      }
-
-      if (h.type == F_PCM) {
-        int ns = (int)(h.length / 2);
-        int16_t *p16 = (int16_t *)payload;
-        if (g_vol != 1.0) {
-          for (int i = 0; i < ns; i++) p16[i] = (int16_t)(p16[i] * g_vol);
-        }
-        ring_write(&g_play_ring, p16, ns);
-        g_downframes++;
-      } else if (h.type == F_FLUSH) {
-        ring_clear(&g_play_ring);
-        if (g_pcm_play) {
-          /* drop 之后必须 prepare，否则下一次 writei 会持续失败 → 完全无声 */
-          snd_pcm_drop(g_pcm_play);
-          snd_pcm_prepare(g_pcm_play);
-        }
-        g_flushes++;
-      } else if (h.type == F_VOLUME) {
-        if (h.length >= 1) {
-          int v = (unsigned char)payload[0];
-          if (v > 100) v = 100;
-          g_vol = v <= 0 ? 0.001 : pow(10.0, (v - 60) / 20.0);
-        }
-      } else if (h.type == F_PING) {
-        send(cfd, "PONG", 4, MSG_NOSIGNAL);
-      }
-    }
-  sess_done:
+    downlink_session(cfd, &payload, &pcap);
     close(cfd);
     logf_("下行断开，等待重连");
   }
@@ -623,7 +615,7 @@ static void *downlink_thread(void *arg) {
   return NULL;
 }
 
-// --------------------------------------------------------------------------- 音量文件 + 本地提示音
+// --------------------------------------------------------------------------- 本地提示音
 /* 提示音不走 play_ring：空闲时 ring 读超时会直接 continue，塞进 ring 常被丢掉。
    改为独立缓冲，在 ALSA 写出前混入；无下行 PCM 时也强制写一帧。 */
 
@@ -642,11 +634,7 @@ static int g_mic_mute_seen = -1; /* -1=尚未同步，边沿不响 */
 /* 本地提示音总增益（相对原先响度） */
 #define SFX_GAIN 0.5
 
-static double sfx_amp_for_pct(int pct) {
-  double level = (double)pct / 100.0;
-  if (level < 0.05) level = 0.05;
-  return (0.35 + 0.65 * (level * level)) * SFX_GAIN;
-}
+static double sfx_amp_for_pct(int pct) { return jarvis_sfx_amp(pct) * SFX_GAIN; }
 
 static void sfx_enqueue(const int16_t *pcm, int len, double amp) {
   if (!pcm || len <= 0) return;
@@ -670,14 +658,11 @@ static void vol_enqueue_dong(int pct) {
   sfx_enqueue(VOL_DONG_PCM, VOL_DONG_LEN, 0.9 * SFX_GAIN);
 }
 
+/* ⚠️ 只允许 playback 线程调用：它读写静态边沿状态 g_mic_mute_seen 并会
+ *    触发提示音。旧实现被 uplink 与 playback 同时调用，同一手势可能响两次
+ *    或一次都不响，还会并发 fopen。uplink 只读镜像后的 g_mic_muted。 */
 static void mute_poll_file(void) {
-  FILE *f = fopen(MUTE_FILE, "r");
-  int v = 0;
-  if (f) {
-    if (fscanf(f, "%d", &v) != 1) v = 0;
-    fclose(f);
-  }
-  v = v ? 1 : 0;
+  int v = jarvis_read_int(JARVIS_MUTE_FILE, 0) ? 1 : 0;
   g_mic_muted = v;
   if (g_mic_mute_seen < 0) {
     g_mic_mute_seen = v;
@@ -734,16 +719,18 @@ static double mono_sec(void) {
   return (double)tv.tv_sec + (double)tv.tv_usec * 1e-6;
 }
 
-static void vol_set_pct(int pct) {
-  if (pct < VOL_MIN_PCT) pct = VOL_MIN_PCT;
-  if (pct > 100) pct = 100;
+/* ⚠️ 只允许 playback 线程调用。它同时是 /tmp/jarvis-vol.pct 的**唯一写者**，
+ *    因此 volumed / led-set.sh 读到的永远是 playback 实际生效的那个值。
+ *    所有音量入路（F_VOLUME 字节、pct 文件）最终都收敛到这一个函数。 */
+static void vol_set_pct(int pct, int announce) {
+  pct = jarvis_vol_clamp(pct);
   if (pct == g_vol_pct) return;
   int first = (g_vol_pct < 0);
   g_vol_pct = pct;
-  /* 百分比线性增益，与灯弧一致 */
-  g_vol = (double)pct / 100.0;
+  g_vol = jarvis_pct_gain(pct); /* 唯一的增益来源，与灯弧同一曲线 */
   g_vol_last_change_sec = mono_sec();
-  if (first) return; /* 开机同步不响 */
+  jarvis_write_int(JARVIS_VOL_PCT_FILE, pct);
+  if (first || !announce) return; /* 开机同步不响 */
   /* 同一手势只响一次；上一段还在播也不打断 */
   if (!g_vol_sfx_armed || vol_dong_pending()) return;
   g_vol_sfx_armed = 0;
@@ -752,13 +739,17 @@ static void vol_set_pct(int pct) {
 }
 
 static void vol_poll_file(void) {
-  FILE *f = fopen(VOL_PCT_FILE, "r");
-  if (!f) return;
-  int p = -1;
-  if (fscanf(f, "%d", &p) == 1 && p >= 0) vol_set_pct(p);
-  fclose(f);
-  if (!g_vol_sfx_armed &&
-      (mono_sec() - g_vol_last_change_sec) >= VOL_SFX_IDLE_SEC) {
+  /* Mac 用 F_VOLUME 表达音量（权威）；只有从未收到过 F_VOLUME 时，
+     才把 pct 文件当作初始值。这样设备端不会自己「回写-读回」形成环。 */
+  if (g_pending_vol_byte >= 0) {
+    int byte = g_pending_vol_byte;
+    g_pending_vol_byte = -1;
+    vol_set_pct(jarvis_byte_to_pct(byte), 1);
+  } else if (g_vol_pct < 0) {
+    int p = jarvis_read_int(JARVIS_VOL_PCT_FILE, -1);
+    if (p >= 0) vol_set_pct(p, 0);
+  }
+  if (!g_vol_sfx_armed && (mono_sec() - g_vol_last_change_sec) >= VOL_SFX_IDLE_SEC) {
     g_vol_sfx_armed = 1;
   }
 }
@@ -774,9 +765,21 @@ static void *playback_thread(void *arg) {
 
   while (!g_stop) {
     g_hb_play++;
+    /* 本线程是所有状态文件的唯一轮询者（见文件头所有权表） */
     if ((tick++ % 5) == 0) {
       vol_poll_file(); /* ~50ms */
       mute_poll_file();
+    }
+
+    if (g_flush_req) {
+      g_flush_req = 0;
+      ring_clear(&g_play_ring);
+      if (g_pcm_play) {
+        /* drop 之后必须 prepare，否则下一次 writei 会持续失败 → 完全无声 */
+        snd_pcm_drop(g_pcm_play);
+        snd_pcm_prepare(g_pcm_play);
+      }
+      prebuf = 0;
     }
 
     int dong = vol_dong_pending();
@@ -820,8 +823,14 @@ static void *playback_thread(void *arg) {
 
     // 硬件只播 index1，但两声道都写（与实测保持一致）
     for (int i = 0; i < FRAME_SAMPLES; i++) {
-      stereo[i * 2] = mono[i];
-      stereo[i * 2 + 1] = mono[i];
+      /* 用户音量在这里施加 —— 全链路唯一的增益点。
+         Mac 侧的 peak_db 是 TTS 响度归一化，与用户音量正交，不能替代。 */
+      double v = (double)mono[i] * g_vol;
+      if (v > 32767.0) v = 32767.0;
+      if (v < -32768.0) v = -32768.0;
+      int16_t s = (int16_t)v;
+      stereo[i * 2] = s;
+      stereo[i * 2 + 1] = s;
     }
     int off = 0;
     while (off < FRAME_SAMPLES && !g_stop) {
@@ -845,6 +854,28 @@ static void *playback_thread(void *arg) {
 
 // --------------------------------------------------------------------------- ALSA
 
+/* 采样率用 set_rate 而非 set_rate_near，并**硬断言**回填值。
+ * 旧实现用 near 且丢弃返回值：万一固件只给 48k，后续全都按 16k 解释，
+ * 帧长/AEC/时间戳一起错 3 倍，而且不会有任何报错。 */
+static int apply_rate(snd_pcm_t *pcm, snd_pcm_hw_params_t *hw, unsigned want,
+                      const char *what) {
+  int dir = 0;
+  int rc = snd_pcm_hw_params_set_rate(pcm, hw, want, dir);
+  if (rc < 0) {
+    logf_("%s: 不支持精确 %u Hz（%s）——拒绝以降级采样率运行", what, want,
+          snd_strerror(rc));
+    return -1;
+  }
+  unsigned got = 0;
+  snd_pcm_hw_params_get_rate(hw, &got, &dir);
+  if (got != want) {
+    logf_("%s: 采样率回填 %u != 请求 %u ——拒绝继续", what, got, want);
+    return -1;
+  }
+  g_rate_ok = 1;
+  return 0;
+}
+
 static int open_capture(void) {
   int rc = snd_pcm_open(&g_pcm_cap, "hw:0,0", SND_PCM_STREAM_CAPTURE, 0);
   if (rc < 0) {
@@ -858,9 +889,12 @@ static int open_capture(void) {
   snd_pcm_hw_params_set_format(g_pcm_cap, hw, SND_PCM_FORMAT_S32_LE);
   unsigned ch = CAP_CH;
   snd_pcm_hw_params_set_channels_near(g_pcm_cap, hw, &ch);
-  unsigned rate = SR;
+  if (ch != CAP_CH) {
+    logf_("采集只给了 %u 通道（需要 %d）", ch, CAP_CH);
+    return -1;
+  }
+  if (apply_rate(g_pcm_cap, hw, SR, "采集") < 0) return -1;
   int dir = 0;
-  snd_pcm_hw_params_set_rate_near(g_pcm_cap, hw, &rate, &dir);
   snd_pcm_uframes_t period = FRAME_SAMPLES;
   snd_pcm_uframes_t buffer = FRAME_SAMPLES * 5;
   snd_pcm_hw_params_set_period_size_near(g_pcm_cap, hw, &period, &dir);
@@ -872,7 +906,8 @@ static int open_capture(void) {
   }
   snd_pcm_prepare(g_pcm_cap);
   snd_pcm_start(g_pcm_cap);
-  logf_("采集 %uch@%uHz period=%u buffer=%u", ch, rate, (unsigned)period, (unsigned)buffer);
+  logf_("采集 %uch@%uHz period=%lu buffer=%lu", ch, SR, (unsigned long)period,
+        (unsigned long)buffer);
   return 0;
 }
 
@@ -889,10 +924,10 @@ static int open_playback(void) {
   snd_pcm_hw_params_set_format(g_pcm_play, hw, SND_PCM_FORMAT_S16_LE);
   unsigned ch = 2;
   snd_pcm_hw_params_set_channels_near(g_pcm_play, hw, &ch);
-  unsigned rate = SR;
+  if (apply_rate(g_pcm_play, hw, SR, "播放") < 0) return -1;
   int dir = 0;
-  snd_pcm_hw_params_set_rate_near(g_pcm_play, hw, &rate, &dir);
   snd_pcm_uframes_t period = FRAME_SAMPLES;
+  snd_pcm_uframes_t period_saved = period;
   snd_pcm_uframes_t buffer = FRAME_SAMPLES * 8;
   snd_pcm_hw_params_set_period_size_near(g_pcm_play, hw, &period, &dir);
   snd_pcm_hw_params_set_buffer_size_near(g_pcm_play, hw, &buffer);
@@ -902,8 +937,21 @@ static int open_playback(void) {
     return -1;
   }
   snd_pcm_prepare(g_pcm_play);
-  logf_("播放 %uch@%uHz period=%u buffer=%u", ch, rate, (unsigned)period, (unsigned)buffer);
+  logf_("播放 %uch@%uHz period=%lu(buffer 目标 %lu) buffer=%lu", ch, SR,
+        (unsigned long)period, (unsigned long)period_saved, (unsigned long)buffer);
   return 0;
+}
+
+// --------------------------------------------------------------------------- 统计
+
+static void dump_stats(void) {
+  double erle_avg = g_erle_n ? g_erle_sum / g_erle_n : 0;
+  logf_("STATS cap=%lu frames=%lu up=%lu drop=%lu down=%lu flush=%lu "
+        "drop[cap=%lu up=%lu play=%lu] clip=%lu sel=%d erle=%.1f/%.1f "
+        "hb[%lu/%lu/%lu/%lu]",
+        g_cap_frames, g_frames, g_upsent, g_upsent_drop, g_downframes, g_flushes,
+        g_cap_ring.dropped, g_up_ring.dropped, g_play_ring.dropped, g_clip, g_sel_ch,
+        erle_avg, g_erle, g_hb_cap, g_hb_proc, g_hb_up, g_hb_play);
 }
 
 // --------------------------------------------------------------------------- main
@@ -913,7 +961,7 @@ static void usage(const char *p) {
           "用法: %s [选项]\n"
           "  -c N   固定麦克风通道 0-5（默认自适应选路）\n"
           "  -a     ch0-5 六路平均后单通道 AEC（省 CPU）\n"
-          "  -g X   麦克风数字增益（默认 56，约 +35dB，说话目标 -18dBFS）\n"
+          "  -g X   麦克风数字增益（默认 20，避开 AEC 定点饱和；要更响用 -p）\n"
           "  -p DB  后置增益 dB（默认 0）\n"
           "  -x     关闭 AEC\n"
           "  -n     关闭降噪（默认开）\n"
@@ -927,7 +975,14 @@ int main(int argc, char **argv) {
   int opt;
   while ((opt = getopt(argc, argv, "c:ag:p:xnAqh")) != -1) {
     switch (opt) {
-      case 'c': g_select_mode = 1; g_fixed_ch = atoi(optarg); break;
+      case 'c':
+        g_select_mode = 1;
+        g_fixed_ch = atoi(optarg);
+        if (g_fixed_ch < 0 || g_fixed_ch >= MIC_CH) {
+          fprintf(stderr, "-c 只接受 0..%d\n", MIC_CH - 1);
+          return 1;
+        }
+        break;
       case 'a': g_select_mode = 2; break;
       case 'g': g_gain_mic = atof(optarg); break;
       case 'p': g_gain_post_db = atoi(optarg); break;
@@ -940,42 +995,72 @@ int main(int argc, char **argv) {
     }
   }
 
+  if (pipe(g_sig_pipe) != 0) {
+    fprintf(stderr, "pipe 失败: %s\n", strerror(errno));
+    return 1;
+  }
+
   signal(SIGINT, on_signal);
   signal(SIGTERM, on_signal);
   signal(SIGUSR1, on_usr1);
   signal(SIGUSR2, on_usr2);
   signal(SIGPIPE, SIG_IGN);
 
-
   if (ring_init(&g_cap_ring, FRAME_SAMPLES * CAP_CH * 8) < 0) return 1;
-  if (ring_init(&g_up_ring, FRAME_SAMPLES * 16) < 0) return 1;
+  if (ring_init(&g_up_ring, FRAME_SAMPLES * UP_RING_FRAMES) < 0) return 1;
   if (ring_init(&g_play_ring, FRAME_SAMPLES * PLAY_RING_FRAMES) < 0) return 1;
 
   if (g_aec_on) {
-    g_echo = speex_echo_state_init(FRAME_SAMPLES, AEC_FILTER_LEN);
-    if (!g_echo) {
-      logf_("AEC 初始化失败");
-      return 1;
+    if (g_select_mode == 2) {
+      /* 平均模式：一路 AEC */
+      g_echo = speex_echo_state_init(FRAME_SAMPLES, AEC_FILTER_LEN);
+      if (!g_echo) {
+        logf_("AEC 初始化失败");
+        return 1;
+      }
+      int sr = SR;
+      speex_echo_ctl(g_echo, SPEEX_ECHO_SET_SAMPLING_RATE, &sr);
+    } else {
+      /* 多通道模式：通道 c 固定使用 g_echo_mic[c]，互不干扰 */
+      for (int c = 0; c < MIC_CH; c++) {
+        g_echo_mic[c] = speex_echo_state_init(FRAME_SAMPLES, AEC_FILTER_LEN);
+        if (!g_echo_mic[c]) {
+          logf_("AEC 初始化失败（ch%d）", c);
+          for (int k = 0; k < c; k++) speex_echo_state_destroy(g_echo_mic[k]);
+          return 1;
+        }
+        int sr = SR;
+        speex_echo_ctl(g_echo_mic[c], SPEEX_ECHO_SET_SAMPLING_RATE, &sr);
+      }
     }
-    int sr = SR;
-    speex_echo_ctl(g_echo, SPEEX_ECHO_SET_SAMPLING_RATE, &sr);
   }
 
   if (g_ns_on) {
     g_pp = speex_preprocess_state_init(FRAME_SAMPLES, SR);
     if (g_pp) {
+      /* 设备上的 libspeexdsp.so.1.5.0 是厂商自建的精简版（53KB，2023-12-06），
+       * **不支持 AGC**：SPEEX_PREPROCESS_SET_AGC(2) 与 SET_AGC_TARGET(46) 都返回 -1。
+       * 而容器里 Debian jessie 的 1.2~rc1.2 支持。所以不能假设「编过 = 能用」，
+       * 每个 ctl 都要检查返回值，不支持的只报一次，不要刷屏。 */
       int one = 1, zero = 0;
-      speex_preprocess_ctl(g_pp, SPEEX_PREPROCESS_SET_DENOISE, &one);
-      speex_preprocess_ctl(g_pp, SPEEX_PREPROCESS_SET_VAD, &zero);
-      /* 固定增益已把说话抬到 -18dBFS；降噪再压约 20dB 噪声底，避免远场底噪被听见 */
+      if (speex_preprocess_ctl(g_pp, SPEEX_PREPROCESS_SET_DENOISE, &one) < 0)
+        logf_("降噪：设备库不支持 SET_DENOISE");
+      if (speex_preprocess_ctl(g_pp, SPEEX_PREPROCESS_SET_VAD, &zero) < 0)
+        logf_("降噪：设备库不支持 SET_VAD");
+      /* 固定增益已把说话抬到合适电平；降噪再压噪声底，避免远场底噪被听见 */
       {
         int ns = -20;
-        speex_preprocess_ctl(g_pp, SPEEX_PREPROCESS_SET_NOISE_SUPPRESS, &ns);
+        if (speex_preprocess_ctl(g_pp, SPEEX_PREPROCESS_SET_NOISE_SUPPRESS, &ns) < 0)
+          logf_("降噪：设备库不支持 SET_NOISE_SUPPRESS");
       }
-      // AGC 默认关：大固定增益 + AGC 容易把噪声底也爬起来。需要时用 -A。
+      // AGC 默认关：大固定增益 + AGC 容易把噪声底也爬起来。
       int agc = g_agc_on ? 1 : 0;
-      speex_preprocess_ctl(g_pp, SPEEX_PREPROCESS_SET_AGC, &agc);
-      if (g_agc_on) {
+      if (speex_preprocess_ctl(g_pp, SPEEX_PREPROCESS_SET_AGC, &agc) < 0) {
+        if (g_agc_on)
+          logf_("⚠️ 设备库不支持 AGC（-A 无效）；用 -p <dB> 做后置增益代替");
+        else
+          logf_("提示：设备库不支持 AGC，AGC 恒为关（不影响默认路径）");
+      } else if (g_agc_on) {
         int target = 12000; /* 约 -8.7 dBFS，留余量防削顶 */
         int inc = 12, dec = 6;
         int maxgain = 16384;
@@ -984,7 +1069,14 @@ int main(int argc, char **argv) {
         speex_preprocess_ctl(g_pp, SPEEX_PREPROCESS_SET_AGC_DECREMENT, &dec);
         speex_preprocess_ctl(g_pp, SPEEX_PREPROCESS_SET_AGC_MAX_GAIN, &maxgain);
       }
-      if (g_aec_on && g_echo) speex_preprocess_ctl(g_pp, SPEEX_PREPROCESS_SET_ECHO_STATE, g_echo);
+      /* 单通道模式下把对应 AEC 接到预处理（normalise 会据此避开回声频点）。
+         多通道模式下各通道系数不同，无法共用，交由 speex 自己处理即可。 */
+      if (g_aec_on) {
+        SpeexEchoState *for_pp = (g_select_mode == 2)
+                                     ? g_echo
+                                     : g_echo_mic[g_select_mode == 1 ? g_fixed_ch : 0];
+        if (for_pp) speex_preprocess_ctl(g_pp, SPEEX_PREPROCESS_SET_ECHO_STATE, for_pp);
+      }
     }
   }
 
@@ -1004,23 +1096,45 @@ int main(int argc, char **argv) {
   pthread_create(&t4, NULL, downlink_thread, &lfd_down);
   pthread_create(&t5, NULL, playback_thread, NULL);
 
-  logf_("就绪 up=%d down=%d AEC=%d NS=%d 选路=%d gain=%.2f post=%ddB", UP_PORT, DOWN_PORT,
-        g_aec_on, g_ns_on, g_select_mode, g_gain_mic, g_gain_post_db);
+  logf_("就绪 up=%d down=%d AEC=%d(%s) NS=%d 选路=%d gain=%.2f post=%ddB",
+        UP_PORT, DOWN_PORT, g_aec_on,
+        g_select_mode == 2 ? "单通道(平均)" : g_select_mode == 1 ? "固定通道" : "6路独立",
+        g_ns_on, g_select_mode, g_gain_mic, g_gain_post_db);
 
+  /* 事件循环：等待自管道（SIGUSR1/SIGUSR2）或 30s 周期，全部打印都在这里做 */
   while (!g_stop) {
-    for (int i = 0; i < 30 && !g_stop; i++) {
-      if (g_do_probe) {
-        g_do_probe = 0;
-        probe_channels();
+    struct pollfd p = {g_sig_pipe[0], POLLIN, 0};
+    int pr = poll(&p, 1, 1000);
+    if (pr > 0 && (p.revents & POLLIN)) {
+      char buf[64];
+      ssize_t n = read(g_sig_pipe[0], buf, sizeof(buf));
+      if (n > 0) {
+        for (ssize_t i = 0; i < n; i++) {
+          if (buf[i] == 'S') g_stats_req = 1;
+          if (buf[i] == 'P') g_probe_req = 1;
+        }
       }
-      sleep(1);
     }
-    if (!g_stop) dump_stats();
+    if (g_stats_req) {
+      g_stats_req = 0;
+      dump_stats();
+    }
+    if (g_probe_req) {
+      g_probe_req = 0;
+      probe_channels();
+    }
+    static unsigned tick_stats = 0;
+    if (++tick_stats >= 30) {
+      tick_stats = 0;
+      dump_stats();
+    }
   }
 
   logf_("退出中…");
   close(lfd_up);
   close(lfd_down);
+  /* 先 shutdown 监听 socket 让 accept 立即返回，再 join。
+     线程本身都跑在带超时的 poll / recv / ring_read 上，1s 内必退。 */
   pthread_join(t1, NULL);
   pthread_join(t2, NULL);
   pthread_join(t3, NULL);
@@ -1030,10 +1144,15 @@ int main(int argc, char **argv) {
   if (g_pcm_cap) snd_pcm_close(g_pcm_cap);
   if (g_pcm_play) snd_pcm_close(g_pcm_play);
   if (g_echo) speex_echo_state_destroy(g_echo);
+  for (int c = 0; c < MIC_CH; c++) {
+    if (g_echo_mic[c]) speex_echo_state_destroy(g_echo_mic[c]);
+  }
   if (g_pp) speex_preprocess_state_destroy(g_pp);
   ring_free(&g_cap_ring);
   ring_free(&g_up_ring);
   ring_free(&g_play_ring);
+  if (g_sig_pipe[0] >= 0) close(g_sig_pipe[0]);
+  if (g_sig_pipe[1] >= 0) close(g_sig_pipe[1]);
   logf_("已退出");
   return 0;
 }

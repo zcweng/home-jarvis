@@ -330,6 +330,9 @@ class EndpointSpeaker:
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._resampler: soxr.ResampleStream | None = None
+        # blocking=True 时不走 _thread，另用计数标记「正在播」，否则 barge-in 的 stop() 看不到 playing、不发 FLUSH
+        self._play_depth = 0
+        self._play_lock = threading.Lock()
         # 设备 play_ring ≈640ms：先突发灌缓冲，再保持略超前，避免严格实时节流一抖就 underrun 卡顿
         self._pace = True
         self.prebuffer_ms = prebuffer_ms
@@ -362,28 +365,34 @@ class EndpointSpeaker:
                 pcm = np.clip(pcm * (target / peak), -1.0, 1.0).astype(np.float32)
 
         def _run() -> None:
-            block = 640  # 40ms @16k，减少 syscall / 调度抖动
-            prebuffer = int(self.prebuffer_ms * TARGET_RATE / 1000.0)
-            lead = self.lead_ms / 1000.0
-            t0 = time.perf_counter()
-            sent = 0
-            for i in range(0, pcm.size, block):
-                if self._stop.is_set():
-                    return
-                chunk = pcm[i : i + block]
-                if chunk.size < block:
-                    chunk = np.pad(chunk, (0, block - chunk.size))
-                if not self.writer.pcm(chunk):
-                    print("⚠️  下行发送失败，放弃本次播放", file=sys.stderr)
-                    return
-                sent += chunk.size
-                if not self._pace or sent < prebuffer:
-                    continue
-                # 保持 lead 秒超前：吸收 Mac 调度抖动，又不超过设备 ~640ms ring
-                due = t0 + sent / TARGET_RATE - lead
-                delay = due - time.perf_counter()
-                if delay > 0.002:
-                    time.sleep(delay)
+            with self._play_lock:
+                self._play_depth += 1
+            try:
+                block = 640  # 40ms @16k，减少 syscall / 调度抖动
+                prebuffer = int(self.prebuffer_ms * TARGET_RATE / 1000.0)
+                lead = self.lead_ms / 1000.0
+                t0 = time.perf_counter()
+                sent = 0
+                for i in range(0, pcm.size, block):
+                    if self._stop.is_set():
+                        return
+                    chunk = pcm[i : i + block]
+                    if chunk.size < block:
+                        chunk = np.pad(chunk, (0, block - chunk.size))
+                    if not self.writer.pcm(chunk):
+                        print("⚠️  下行发送失败，放弃本次播放", file=sys.stderr)
+                        return
+                    sent += chunk.size
+                    if not self._pace or sent < prebuffer:
+                        continue
+                    # 保持 lead 秒超前：吸收 Mac 调度抖动，又不超过设备 ~640ms ring
+                    due = t0 + sent / TARGET_RATE - lead
+                    delay = due - time.perf_counter()
+                    if delay > 0.002:
+                        time.sleep(delay)
+            finally:
+                with self._play_lock:
+                    self._play_depth = max(0, self._play_depth - 1)
 
         if blocking:
             _run()
@@ -410,7 +419,10 @@ class EndpointSpeaker:
 
     @property
     def playing(self) -> bool:
-        return self._thread is not None and self._thread.is_alive()
+        if self._thread is not None and self._thread.is_alive():
+            return True
+        with self._play_lock:
+            return self._play_depth > 0
 
     def set_volume_byte(self, v: int) -> bool:
         return self.writer.volume_byte(v)

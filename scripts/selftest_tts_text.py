@@ -69,6 +69,10 @@ def main() -> int:
         out = normalize_for_tts(src)
         check(f"句子 {src}", must in out, out if must not in out else "")
 
+    mix = "老虎英文是 tiger。"
+    keep = normalize_for_tts(mix, latin=False)
+    check("latin=False 保留英文", keep == mix, keep if keep != mix else "")
+
     if pure:
         print("（--pure：跳过神经 TTS 与 say 的音频检查）")
         ok = all(r[1] for r in results)

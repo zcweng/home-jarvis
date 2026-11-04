@@ -71,6 +71,8 @@ class Settings:
     speaker_down_port: int = 8766          # 下行 PCM 端口
     # S12 灯环 / 音量（设备端 tools/s12led）
     led_enabled: bool = True
+    # 历史遗留字段：灯控实际走 SSH 执行 /data/jarvis-led-set.sh，
+    # 这个端口从未被监听，保留仅为兼容旧配置。
     led_port: int = 8767
     volume_percent: int = 70
     volume_udp_port: int = 8769
@@ -78,7 +80,7 @@ class Settings:
     asr_model_dir: str = "models/sensevoice"
     asr_language: str = "zh"
     # TTS
-    tts_backend: str = "neural"       # neural（本地 VITS，自然）| say（macOS 系统合成，快但生硬）
+    tts_backend: str = "neural"       # neural（本地 VITS）| nano（MOSS-TTS-Nano 侧车）| say
     tts_model_dir: str = "models/vits-zh-hf-fanchen-C"
     tts_threads: int = 4
     tts_sid: int = 0                  # 多说话人模型选第几个
@@ -86,6 +88,13 @@ class Settings:
     say_rate: int = 170               # macOS say 语速（默认 175 偏快）
     tts_mode: str = "direct"
     tts_voice_say: str = "Tingting"
+    # Nano 侧车（./scripts/nano_tts_server.sh；默认不启）
+    tts_nano_url: str = "http://127.0.0.1:8091"
+    tts_nano_ref_audio: str = "tools/nano-tts/MOSS-TTS-Nano/assets/audio/zh_1.wav"
+    tts_nano_stream: bool = True
+    tts_nano_timeout: float = 8.0
+    tts_nano_speed: float = 1.0
+    tts_nano_fallback: str = "neural"  # neural | say | none
     # VAD
     vad_model: str = "models/silero-vad/silero_vad.onnx"
     vad_threshold: float = 0.5
@@ -145,6 +154,12 @@ class Settings:
             say_rate=_env_int("SAY_RATE", cls.say_rate),
             tts_mode=_env("TTS_MODE", cls.tts_mode),
             tts_voice_say=_env("TTS_VOICE_SAY", cls.tts_voice_say),
+            tts_nano_url=_env("TTS_NANO_URL", cls.tts_nano_url),
+            tts_nano_ref_audio=_env("TTS_NANO_REF_AUDIO", cls.tts_nano_ref_audio),
+            tts_nano_stream=_env("TTS_NANO_STREAM", "true").lower() in ("1", "true", "yes"),
+            tts_nano_timeout=_env_float("TTS_NANO_TIMEOUT", cls.tts_nano_timeout),
+            tts_nano_speed=_env_float("TTS_NANO_SPEED", cls.tts_nano_speed),
+            tts_nano_fallback=_env("TTS_NANO_FALLBACK", cls.tts_nano_fallback),
             vad_model=_env("VAD_MODEL", cls.vad_model),
             vad_threshold=_env_float("VAD_THRESHOLD", cls.vad_threshold),
             vad_silence_ms=_env_int("VAD_SILENCE_MS", cls.vad_silence_ms),

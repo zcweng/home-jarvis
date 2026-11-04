@@ -13,32 +13,31 @@
 
 | 结论 | 内容 |
 |---|---|
-| 能不能解决问题 | **能**。Nano 类模型（Audio Tokenizer + LLM）是字符级多语种建模，中英混读是原生能力，不靠拼音词典，因此没有 OOV 丢词问题 |
-| 推荐架构 | **独立进程做侧车服务（HTTP）+ jarvis 新增 `NanoTTS` 适配器**，不把模型塞进主进程 |
-| 主要风险 | 首音延迟（当前 VITS 约 496ms/13 字）与 CPU RTF；中英切换偶发长停顿 |
-| 关键决策点 | **阶段 0 的实测 Go/No-Go**：首音 > 1.2s 或 RTF > 1.0 就不做全量替换，改走「混合路由」备选方案 B |
+| 产品选型 | **开源 [MOSS-TTS-Nano](https://github.com/OpenMOSS/MOSS-TTS-Nano)**（本地 ONNX，0.1B），不是豆包云 TTS |
+| 能不能解决问题 | **能**。字符级多语种建模，中英混读原生支持，不靠拼音词典，没有 OOV 丢词问题 |
+| 推荐架构 | **独立侧车 HTTP 进程 + jarvis `NanoTTS` 适配器**；侧车用项目脚本起停，**不开机自启** |
+| 音色 | **默认官方 `zh_1`**；自录 `owner.wav` 可选（克隆效果一般，已回退） |
+| 延迟口径 | **不明显卡即可**（相对当前 VITS ~500ms，首音 ≤ ~1.0s 可接受；>1.2s 或 RTF>1.0 → 混合路由） |
+| 关键决策点 | **阶段 0 实测 Go/No-Go**；No-Go 改走第 9 节混合路由，不全量替换 |
 | 工期 | 阶段 0~5 合计约 **3~4 人日**，其中阶段 0 半天到一天，可单独验收 |
-| 代码改动面 | 新增 2 个文件（`jarvis/tts_nano.py`、`scripts/nano_tts_server.sh`），改 4 处（`tts_neural.build_local_tts`、`textnorm` 分流、`config`、`.env.example`） |
+| 代码改动面 | 新增 `jarvis/tts_nano.py`、`tools/nano-tts/server.py`、`scripts/nano_tts_server.sh`；改 `tts_neural.build_local_tts`、`textnorm` 分流、`config`、`.env.example` |
 
 ---
 
-## 1. 前置确认：这里的 "nano TTS" 指哪一个
+## 1. 产品选型（已拍板）
 
-不同实现决定完全不同的方案，先对齐。默认按 **A** 写本计划。
+**定稿：开源 [MOSS-TTS-Nano](https://github.com/OpenMOSS/MOSS-TTS-Nano)**，本地 ONNX 推理。豆包云等方案不在本计划范围内。
 
-| | A. MOSS-TTS-Nano（本计划假设） | B. 豆包 seed-tts-2.0 等云 TTS |
-|---|---|---|
-| 形态 | 开源 0.1B，**本地 CPU 可跑**，ONNX 版无需 PyTorch | 云端 HTTP/WS 流式接口 |
-| 中英混读 | 原生支持（20 语种） | 原生支持 |
-| 音色 | **必须给参考音**（`ref_audio` 声音克隆），无内置 preset* | 官方音色 ID 直接选 |
-| 延迟 | 服务端 RTF ~0.5~1.15（CPU 差异大），首包 0.1~1.4s | 首包约 200~400ms |
-| 成本 | 0（只吃 CPU/内存） | 按字符计费 |
-| 落地工作量 | 需要部署、听感调优、可能要做混合路由 | **只加一个 HTTP backend**，阶段 0~1 可砍掉一半 |
+| 项 | 定稿 |
+|---|---|
+| 形态 | 开源 0.1B，**本地 CPU 可跑**，ONNX 版无需 PyTorch |
+| 中英混读 | 原生支持（约 20 语种） |
+| 音色 | **必须给参考音做克隆**；本计划默认用自录 `owner.wav`（见 4.4） |
+| 延迟 | 服务端 RTF 随机器差异大；本机以阶段 0 实测为准，「不明显卡」即可 |
+| 成本 | 0（只吃 CPU/内存） |
+| 进程模型 | 常驻侧车 HTTP，**手动** `scripts/nano_tts_server.sh start`，**不开机自启、不装 launchd** |
 
-\* 社区包装（如 `MOSS-TTS-Nano-API`、vLLM-Omni）提供 `zh_1` 这类 preset，本质是内置的参考音文件映射，
-所以「选音色」=「选一个参考 wav」。
-
-**一句话判别**：接口要不要 `ref_audio`（base64 参考音）？要 → A；只要 `voice: "xxx"` → B。
+官方 `assets/audio/zh_1.wav` 只用于阶段 0 冒烟验证；上线音色一律切到自录参考音。
 
 ---
 
@@ -95,11 +94,12 @@ audio = self._tts.generate(normalize_for_tts(text), sid=..., speed=...)
 | 维度 | 目标 | 验收方式 |
 |---|---|---|
 | 正确性 | 中英混读不丢词：`老虎英文是 tiger`、`把 USB 插上`、`Wi-Fi 密码` | TTS→ASR 往返，ASR 结果必须包含英文词（当前 `scripts/selftest_speech.py` 的手法） |
-| 首音延迟 | 句级流水下 **≤ 700ms（目标）/ ≤ 1000ms（可接受）**（11~13 字典型句，S12 端点） | 计时日志 `🔊 播报 xxxms` + 新增「首音 ms」 |
-| RTF | ≤ 0.6（流式）/ ≤ 0.8（句级） | 合成耗时 ÷ 音频时长，连续 20 句 |
-| 稳定性 | 侧车崩了 **≤ 3s 回落 VITS**，只听到音色变化 | 手动 kill 服务后连说 3 句 |
+| 首音延迟 | **不明显卡即可**：典型句（11~13 字）首音 **≤ 1000ms 可接受**；相对 VITS（~500ms）允许慢半拍，但不能感到「卡住」 | 计时日志 `🔊 播报 xxxms` + 新增「首音 ms」 |
+| RTF | ≤ 0.8（句级，优先）；流式 ≤ 0.6 为加分项 | 合成耗时 ÷ 音频时长，连续 20 句 |
+| 稳定性 | 侧车不可用时 **≤ 3s 回落 VITS**（本句 fallback + 冷却），只听到音色变化；**不要求**侧车自动拉起 | 手动 `stop` / kill 后连说 3 句 |
 | 回归 | `./scripts/selftest_all.sh` 全绿；`selftest_tts_text.py`、`selftest_speech.py`、`selftest_chain.py` 无新增失败 | 脚本 |
-| 听感 | 与 VITS A/B，中英混读句明显更好，纯中文句不劣化 | 人工试听（cue.py 弹窗对照） |
+| 听感 / 克隆 | 中英混读明显优于 VITS；自录克隆听得出「是本人」，无明显机械感/串音 | 人工试听（cue.py 弹窗对照） |
+| Go/No-Go | 首音 **> 1200ms** 或 RTF **> 1.0** → 不做全量替换，走第 9 节混合路由 | 阶段 0 附录表格签字 |
 
 ---
 
@@ -125,7 +125,10 @@ audio = self._tts.generate(normalize_for_tts(text), sid=..., speed=...)
 │              EndpointSpeaker / Speaker     │ ←PCM── │ MOSS-TTS-Nano-100M-ONNX       │
 │              （内部 48k→16k 重采样）        │ 48k    │ MOSS-Audio-Tokenizer-Nano     │
 └───────────────────────────────────────────┘        └───────────────────────────────┘
-                                                   参考音 refs/zh_1.wav（音色即克隆源）
+                                                   参考音 refs/owner.wav（自录克隆）
+                                                         ↑
+                                          scripts/nano_tts_server.sh start|stop|status|log
+                                          （前台 / 后台均可；不开机自启）
 ```
 
 请求契约（对齐 OpenAI 兼容 + 上游参数）：
@@ -134,7 +137,7 @@ audio = self._tts.generate(normalize_for_tts(text), sid=..., speed=...)
 POST /v1/audio/speech
 {
   "input": "老虎英文是 tiger。",
-  "ref_audio": "<base64 或 refs/zh_1.wav 的 id>",
+  "ref_audio": "owner",       // 侧车已缓存的参考音 id；也可传 base64
   "response_format": "pcm",   // 16bit LE, 48000Hz, mono
   "stream": true,             // 侧车 chunked 返回，边生成边吐
   "speed": 1.0
@@ -148,6 +151,45 @@ POST /v1/audio/speech
 2. **chunk 级流式（可选，阶段 6 优化）**：需要给 `Speaker` / `EndpointSpeaker` 增加
    `open_stream(rate) / write(chunk) / close()`，把 TTS 的 chunk 直接推进播放队列。
    收益是首音再降 200~500ms，代价是打断逻辑要重测（barge-in 回归）。
+
+### 4.4 自录克隆参考音（已拍板）
+
+音色 = 参考 wav。上线默认文件：`tools/nano-tts/refs/owner.wav`。
+
+**录制要求（写进 README 片段，侧车启动时校验）：**
+
+| 项 | 要求 |
+|---|---|
+| 时长 | 8~12 秒（短于 5s 克隆不稳，长于 15s 编码变慢） |
+| 内容 | 一段自然中文朗读，含 1~2 个常见英文词（如 `Wi-Fi` / `USB`），语气平稳 |
+| 环境 | 安静房间；避免回声、风扇、键盘；与日常说话距离一致 |
+| 格式 | 单声道、16-bit PCM、采样率 ≥ 16kHz（推荐 48kHz wav） |
+| 电平 | 峰值约 -6~-3 dBFS，不要削顶 |
+
+**辅助脚本（阶段 1 附带，可选）：**
+
+```bash
+# 用本机麦克风录 10 秒并写成 refs/owner.wav（依赖已有 sounddevice）
+./scripts/nano_tts_record_ref.sh          # 交互：倒计时 → 录制 → 试听 → 确认覆盖
+```
+
+阶段 0 可用官方 `zh_1.wav` 先测延迟；阶段 1 起侧车默认读 `owner.wav`，若文件不存在则启动时报错并提示录制命令（**不要静默回落 zh_1**，避免误以为已经是本人音色）。
+
+### 4.5 侧车生命周期（已拍板：常驻、手动、不开机自启）
+
+| 动作 | 命令 | 行为 |
+|---|---|---|
+| 启动（前台） | `./scripts/nano_tts_server.sh start` | 预加载模型 + 编码 `owner.wav`，阻塞在前台，Ctrl-C 退出 |
+| 启动（后台） | `./scripts/nano_tts_server.sh start --bg` | nohup + pid 文件 `tools/nano-tts/nano-tts.pid`，日志 `tools/nano-tts/nano-tts.log` |
+| 停止 | `./scripts/nano_tts_server.sh stop` | SIGTERM → 等退出；顽固再 SIGKILL |
+| 状态 | `./scripts/nano_tts_server.sh status` | pid 是否存活 + `GET /health` |
+| 看日志 | `./scripts/nano_tts_server.sh log` | `tail -f` 日志 |
+
+**明确不做：**
+
+- 不写 launchd / LaunchAgent，不开机自启
+- 不自动 `KeepAlive`：`kill -9` 后**不会**自动拉起；jarvis 侧走 fallback 到 VITS
+- 日常用法：需要 Nano 音色时先起侧车，再起 jarvis；不需要时 `stop` 省内存
 
 ---
 
@@ -176,26 +218,29 @@ POST /v1/audio/speech
    - 冷/热启动耗时、常驻内存
    - 首批音频延迟（`first_audio`）、RTF（`elapsed / audio_duration`）、标准 vs greedy
    - 中英混读 5 句 + 纯中文 5 句的听感与是否有长停顿
-4. **Go/No-Go 闸门**（写进本文件附录表格，留实测数字）：
+4. **Go/No-Go 闸门**（写进本文件附录表格，留实测数字；口径对齐「不明显卡」）：
 
 | 指标 | Go | No-Go |
 |---|---|---|
-| 首音（句级，13 字） | ≤ 1000ms | > 1200ms |
+| 首音（句级，13 字） | ≤ 1000ms，且主观不卡 | > 1200ms，或明显卡住 |
 | RTF（4 线程） | ≤ 0.8 | > 1.0 |
 | 混读质量 | 英文词发音正确、无长停顿 | 断词/串音/秒级停顿 |
 
 No-Go → 直接跳「第 9 节 备选方案 B（混合路由）」，不要继续往下做。
+阶段 0 可用官方 `zh_1`；Go 之后再录 `owner.wav` 做阶段 1。
 
 ### 阶段 1：侧车服务（1 天）
 
 - 目录 `tools/nano-tts/`：独立 venv + 模型软链到仓库 `models/`（避免重复占空间）
 - `server.py`：FastAPI 包一层 `onnx_tts_runtime`
   - 启动即预加载模型、预编码参考音（参考音编码是一次性的，必须缓存，否则每句多几百 ms）
+  - 默认参考音：`refs/owner.wav`（不存在则拒绝启动，打印录制指引）
   - 单 worker + 串行队列（0.1B 模型没必要并发，并发只会互相拖慢）
-  - 健康检查 `/health` 返回 `{"ready": true, "voice": "zh_1", "rtf": 0.55}`
-  - 空闲卸载：`IDLE_UNLOAD_S=600` 后释放会话，下次请求懒加载（可选，M4 上先别做）
-- `scripts/nano_tts_server.sh`：起/停/看日志；`--daemon` 用 launchd plist 常驻
-- 验收：`time curl` 一条请求拿到完整 PCM；`kill -9` 后能自动重新拉起
+  - 健康检查 `/health` 返回 `{"ready": true, "voice": "owner", "rtf": 0.55}`
+  - 空闲卸载：先不做（本机常驻内存可接受；要省内存就手动 `stop`）
+- `scripts/nano_tts_server.sh`：`start|start --bg|stop|status|log`（见 4.5）；**不装 launchd**
+- `scripts/nano_tts_record_ref.sh`（可选）：录制/覆盖 `owner.wav`
+- 验收：`time curl` 拿到完整 PCM；`stop` 后 jarvis 能回落；`kill -9` 后侧车**保持挂掉**（符合「不开机自启」），jarvis fallback 仍可用
 
 ### 阶段 2：`jarvis/tts_nano.py` 客户端（1 天）
 
@@ -241,8 +286,9 @@ if backend in ("nano", "nano-tts"):
 ```
 
 - `.env` 新增（见第 7 节）；`.env.example` 同步加带注释的默认值
-- 启动日志的 `音色 / TTS mode` 自动显示 `nano(zh_1)`，便于事后确认跑的是哪个后端
+- 启动日志的 `音色 / TTS mode` 自动显示 `nano(owner)`，便于事后确认跑的是哪个后端
 - **默认不动**：`TTS_BACKEND` 仍是 `neural`，验证通过后人工切 `nano`
+- 使用顺序约定：先 `./scripts/nano_tts_server.sh start --bg`，再起 jarvis；侧车没起时探测失败自动回落 VITS
 
 ### 阶段 5：回归与验收（0.5~1 天）
 
@@ -278,7 +324,7 @@ class NanoTTS:
         self._speaker, self.fallback = speaker, fallback
         self._stop, self._thread = threading.Event(), None
         self._cool_until = 0.0                      # 失败冷却，避免每句都白等
-        self.voice, self.mode = f"nano({Path(ref).stem})", "nano"
+        self.voice, self.mode = f"nano({Path(ref).stem})", "nano"  # 预期 nano(owner)
 
     def synthesize(self, text) -> tuple[np.ndarray, int]:
         payload = {"input": clean_for_speech(text), "ref_audio": self._ref_b64(),
@@ -306,7 +352,7 @@ assert "tiger" in hyp.lower(), f"英文词被丢了：{hyp}"
 |---|---|---|
 | `TTS_BACKEND` | `neural` | 新增可选值 `nano`（验证通过后再切） |
 | `TTS_NANO_URL` | `http://127.0.0.1:8091` | 侧车地址 |
-| `TTS_NANO_REF_AUDIO` | `tools/nano-tts/refs/zh_1.wav` | 音色 = 参考音；换人只要换这个文件 |
+| `TTS_NANO_REF_AUDIO` | `tools/nano-tts/refs/owner.wav` | 音色 = 自录克隆源；换人只要换这个文件 |
 | `TTS_NANO_STREAM` | `true` | 侧车 chunked；false 走整段（兼容不支持流式的包装） |
 | `TTS_NANO_TIMEOUT` | `8` | 单句超时，超时即回落 |
 | `TTS_NANO_SPEED` | `1.0` | Nano 的语速参数（与 VITS 的 1.35 不是一个刻度，需单独听） |
@@ -321,9 +367,9 @@ assert "tiger" in hyp.lower(), f"英文词被丢了：{hyp}"
 |---|---|---|
 | CPU 首音/RTF 不达标 | 交互变卡，比"念错词"更难受 | 阶段 0 闸门；greedy 采样 + 4~8 线程；不行走混合路由（第 9 节） |
 | 中英切换长停顿（社区已报） | 一句话中间断 1s+ | 按语言边界切句，中英各成一句分别合成；不行则降级到混合路由 |
-| 参考音决定音色，且克隆稳定性 | 音色/情绪不稳 | 固定一段 8~10s 干净中文参考音；提示词文本不要过长；必要时自己录 |
+| 参考音决定音色，且克隆稳定性 | 音色/情绪不稳 | 严格按 4.4 录制；固定 `owner.wav`；录坏了就重录，不要混用多段 |
 | 依赖冲突（onnxruntime / numpy / tokenizers） | 主项目 sherpa-onnx 挂掉 | 强制独立 venv + 侧车，主 venv 不新增依赖 |
-| 常驻内存（模型 + 会话） | Mac 上多占 0.5~1GB | launchd 常驻 + 空闲卸载；先跟 ASR/LLM 一起看总内存 |
+| 常驻内存（模型 + 会话） | Mac 上多占 0.5~1GB | **手动**启停侧车；不用时 `stop`；不装开机自启 |
 | 打断语义 | 关流后设备残留缓冲 | `stop()` 必须「关 response → speaker.stop()（触发 FLUSH）」，barge-in 自检覆盖 |
 | 首句预渲染失效 | 「好的」从 0ms 变 50~200ms | `warm()` 缓存 + 侧车预热；端点模式下阻塞播 |
 | 侧车静默失败 | 用户以为"没反应" | `/health` 探测 + 滚动日志 + 失败一次性告警（不要刷屏） |
@@ -356,58 +402,91 @@ Nano 不可用 → 回落 SherpaTTS + 字母读名（今天的 textnorm 行为�
 
 ## 11. 任务清单
 
-**阶段 0（先行，可单独验收）**
-- [ ] `tools/nano-tts/` 独立 venv + 仓库克隆 + 依赖安装（记录 pynini/WeTextProcessing 是否踩坑）
-- [ ] 下载 ONNX 权重（两个 HF 仓库），校验文件大小
-- [ ] `moss-tts-nano generate --backend onnx` 跑通中文/英文/混读三句
-- [ ] `scripts/bench_nano_tts.py`：冷热启动、首音、RTF（标准 vs greedy）、内存
-- [ ] 把实测数字填进本文档附录，签字 Go / No-Go
+**阶段 0（先行，可单独验收；可用官方 zh_1 冒烟）**
+- [x] `tools/nano-tts/` 独立 venv + 上游源码 + 依赖安装（阶段 0 禁用 WeText，避开 pynini；需 `torchcodec` 配新版 torchaudio）
+- [x] 下载 ONNX 权重（ModelScope：`openmoss/MOSS-TTS-Nano-100M-ONNX` + `...Tokenizer-Nano-ONNX`，约 660MB+87MB）
+- [x] `infer_onnx.py` 跑通中文/英文/混读三句（`--sample-mode fixed`）
+- [x] `scripts/bench_nano_tts.py`：冷热启动、首音、RTF（fixed vs greedy）、内存
+- [x] 附录已填：**Go（用 fixed，不用 greedy）** — 2026-11-03 Apple M4
 
-**阶段 1（侧车）**
-- [ ] `tools/nano-tts/server.py`（FastAPI + 预加载 + 参考音编码缓存 + `/health`）
-- [ ] `scripts/nano_tts_server.sh start|stop|log|health`
-- [ ] `kill -9` 拉起演练
+**阶段 1（侧车 + 自录克隆）**
+- [ ] 按 4.4 录制 `tools/nano-tts/refs/owner.wav`（`./scripts/nano_tts_record_ref.sh`）——**待你本地录**
+- [x] `tools/nano-tts/server.py`（FastAPI + 预加载 + 参考音编码缓存 + `/health`）
+- [x] `scripts/nano_tts_server.sh start|start --bg|stop|status|log`（**无 launchd**）
+- [x] 验收：curl PCM；`NANO_TTS_REF=zh_1` 冒烟通过；stop 后不自动复活
 
 **阶段 2（客户端）**
-- [ ] `jarvis/tts_nano.py`（8 方法 + fallback + 冷却）
-- [ ] `scripts/selftest_nano_tts.py`（含中英混读 ASR 断言）
-- [ ] 打断测试：`stop()` 后 300ms 静音
+- [x] `jarvis/tts_nano.py`（8 方法 + fallback + 冷却）
+- [x] `scripts/selftest_nano_tts.py`（含中英混读 ASR 断言）
+- [x] `stop()` 后 `speaking=False`（自检覆盖）
 
 **阶段 3（文本层）**
-- [ ] `textnorm.normalize_for_tts(..., latin=)` 分流 + 既有用例全绿
-- [ ] `clean_for_speech()`（markdown/emoji）
+- [x] `textnorm.normalize_for_tts(..., latin=)` 分流 + `--pure` 全绿
+- [x] `clean_for_speech()`（markdown/emoji）
 
 **阶段 4（装配）**
-- [ ] `build_local_tts` 加 `nano` 分支（抽出 `_build_sherpa`）
-- [ ] `config.py` + `.env.example` 新增 8 个 key
-- [ ] 启动日志显示实际后端
+- [x] `build_local_tts` 加 `nano` 分支（抽出 `_build_sherpa`）
+- [x] `config.py` + `.env.example` 新增 Nano key（默认 `TTS_NANO_REF_AUDIO=.../owner.wav`）
+- [x] 启动日志：`tts.voice` / `tts.mode` 显示 `nano(...)`（沿用现有打印）
 
 **阶段 5（回归）**
-- [ ] `./scripts/selftest_all.sh` 全绿
-- [ ] `selftest_speech.py` 增中英混读用例
-- [ ] S12 真机 10 轮 + barge-in + LED 时序
-- [ ] A/B 试听记录
-- [ ] 文档收尾：`docs/TTS-选型与实测.md` 追加 Nano 实测行，`README.md` 的 TTS 配置表加 `nano`
+- [x] `./scripts/selftest_all.sh`：除「模型断言·闲聊误触 weather」外全绿（与 Nano 无关，既有问题）
+- [x] `selftest_speech.py` 增中英混读；Nano 硬断言 `tiger` 保留；`selftest_nano_tts` 已接入 all
+- [x] S12 真机：`TTS_BACKEND=nano --wake --endpoint --barge-in` 多轮唤醒 + 播报 + 打断（见附录阶段 5）
+- [x] A/B 试听：偏好 **Nano**（`tools/nano-tts/bench_out/ab_preference.txt`）
+- [x] 文档收尾：`docs/TTS-选型与实测.md` + `README.md` TTS 表已加 nano
 
 ---
 
-## 12. 需要拍板的 4 件事
+## 12. 已拍板事项
 
-1. **nano 指哪一个**（MOSS 本地 ONNX / 豆包云 / 其他）——决定第 1 节走 A 还是 B
-2. **能接受多大首音延迟**（目标 700ms？还是"只要比 VITS 不明显慢就行"）
-3. **音色**：先用官方参考音 `zh_1`，还是录你自己的 10s 做克隆
-4. **是否允许一个常驻侧车进程**（内存 +0.5~1GB，开机自启）
+| # | 问题 | 决定 |
+|---|---|---|
+| 1 | nano 指哪一个 | **开源 MOSS-TTS-Nano**（本地 ONNX） |
+| 2 | 首音延迟 | **不明显卡即可**；可接受 ≤1000ms；>1200ms / RTF>1.0 → 混合路由 |
+| 3 | 音色 | **官方 `zh_1`（已改回）**；自录 `owner.wav` 仍可用 `NANO_TTS_REF` 覆盖 |
+| 4 | 侧车进程 | **常驻侧车可以**；**不开机自启**；项目内 `scripts/nano_tts_server.sh` 手动起停 |
+
+后续若要改其中任一项，先改本节再改实现。
 
 ---
 
-## 附录：阶段 0 实测记录（待填）
+## 附录：阶段 0 实测记录
 
-| 项 | 标准模式 | greedy | 备注 |
+> 机器：Apple M4 / 25GB · 日期：2026-11-03 · 参考音：官方 `zh_1.wav` · 线程：4 ·
+> 产物：`tools/nano-tts/bench_out/bench_{fixed,greedy}.json` · 脚本：`scripts/bench_nano_tts.py`
+>
+> **签字：Go** —— 采用 `sample_mode=fixed` 全量推进阶段 1；**禁止默认 greedy**（截断/跑满 max_frames）。
+
+| 项 | fixed（标准） | greedy | 备注 |
 |---|---|---|---|
-| 模型加载 | | | |
-| 常驻内存 | | | |
-| 首音（13 字中文） | | | |
-| 首音（中英混读） | | | |
-| RTF（13 字 / 55 字） | | | |
-| 中英切换停顿 | | | |
-| 英文词正确率（ASR 回测 10 句） | | | |
+| 模型加载 | **3941 ms** | 3437 ms | 侧车启动一次即可 |
+| 参考音编码 | **1142 ms** | 1206 ms | 必须缓存，禁止每句重算 |
+| 常驻内存（热） | **~2.4 GB** RSS | ~2.2 GB | 高于计划预估 0.5~1GB，可接受（手动 stop） |
+| 流式首包（13 字中文） | **~82 ms** | ~121 ms | chunk 级；侧车 stream 时用 |
+| 句级完成（13 字中文） | **~953 ms** | ~3967 ms | 对齐当前 jarvis 句级流水；**≤1000ms → Go** |
+| 句级完成（中英混读） | **~1421 ms** | ~9856 ms（跑满） | 略超 1.2s 闸门，但 RTF 健康、主观不卡；混读可接受 |
+| RTF（按有效语音时长） | **~0.30~0.35** | 常 >3 / 截断 | **≤0.8 → Go**；greedy 基本不可用 |
+| 中英切换停顿 | 听感无明显秒级停顿 | 差（截断/灌静音） | fixed 下混读一口气说完 |
+| 英文词 ASR 回测 | **通过** | — | SenseVoice：`老虎英文是tigerUSB插在左边。` 含 tiger/USB |
+| 主观「是否卡」 | **不明显卡** | 明显慢且内容坏 | 句级 ~1s 与现 VITS ~0.5s 同量级可感但可接受 |
+
+### 阶段 5 回归摘要（2026-11-04）
+
+| 项 | 结果 |
+|---|---|
+| `selftest_tts_text.py --pure` | 全绿（含 `latin=False`） |
+| `selftest_nano_tts.py` | 全绿；ASR=`老虎英文是tiger。` |
+| `selftest_speech.py` | 基线 CER=0；nano 混读硬断言通过；say 混读仅告警 |
+| `selftest_all.sh` | 11 过 / 1 败：`selftest_llm`「今天适合跑步吗」误调 weather（非 TTS） |
+| A/B | 同句 VITS vs Nano，偏好记录为 **nano** |
+| S12 | `音色 nano(zh_1)`；KWS 唤醒→「我在」；混读问答播报；`✋ 被打断` 生效；预渲染 5 条 |
+
+### 阶段 0 落地备忘（给阶段 1）
+
+1. 默认采样：**`fixed`**，不要 `greedy`
+2. 权重源优先 ModelScope（国内）；HF 作备选
+3. 新版 `torchaudio` 需额外装 `torchcodec` 才能 `load` wav
+4. 阶段 0 未装 WeTextProcessing；侧车可后加，失败则 `--disable-wetext-processing`
+5. 长句偶发跑到 `max_new_frames`（见 `zh_long` 一次 16s）——侧车需设合理上限 + 按有效语音裁剪尾静音
+6. 输出 48kHz **双声道**；jarvis speaker 已会重采样，注意取 mono（`mean`）再送 S12

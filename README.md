@@ -159,7 +159,9 @@ python scripts/gen_aliases.py             # 追加写入 config/aliases.yaml（�
 | `HA_TOKEN` / `HA_URL` | — / `http://127.0.0.1:8123` | HA 长期令牌与地址（令牌只在这里，别提交） |
 | `DEEPSEEK_KEY` / `LLM_MODEL` | — / `deepseek-flash` | 控制类走 flash；闲聊可换大模型 |
 | `INPUT_DEVICE` / `OUTPUT_DEVICE` | `外置麦克风` / 系统默认 | **按名字子串匹配**，不写索引；未命中回落默认并告警 |
-| `TTS_BACKEND` | `neural` | `neural`=本地 VITS（自然）｜`say`=系统合成（快但生硬） |
+| `TTS_BACKEND` | `neural` | `neural`=本地 VITS｜`nano`=MOSS-TTS-Nano 侧车（中英混读）｜`say`=系统合成 |
+| `TTS_NANO_URL` | `http://127.0.0.1:8091` | Nano 侧车地址；先 `./scripts/nano_tts_server.sh start --bg` |
+| `TTS_NANO_REF_AUDIO` | `…/zh_1.wav` | Nano 参考音色（默认官方 zh_1） |
 | `TTS_TARGET` | `speaker` | `speaker`=小爱出声｜`local`=电脑喇叭｜`both`=调试（有回声） |
 | `SPEAKER_FALLBACK_LOCAL` | `true` | 音箱不可达/云端报错时回落电脑喇叭 |
 | `TTS_SPEED` | `1.35` | 语速倍数（1.0 明显偏慢，1.3~1.5 接近日常） |
@@ -241,9 +243,42 @@ models/                模型权重（脚本下载，不入库）
 | [`docs/P0-本机语音闭环方案.md`](docs/P0-本机语音闭环方案.md) | 本机闭环的选型、macOS 坑位、落地顺序、迁移约定 |
 | [`docs/接米家设备-操作手册.md`](docs/接米家设备-操作手册.md) | 米家 OAuth 五步 + 6 个排障项 |
 | [`docs/TTS-选型与实测.md`](docs/TTS-选型与实测.md) | 四条 TTS 路线实测对比（含首包与音质） |
+| [`docs/S12-AEC数据流方案.md`](docs/S12-AEC数据流方案.md) | S12 音箱 AEC 数据流：为什么用 ch7 数字环回、16k 直采、AEC 实测参数 |
+| [`docs/S12-设备状态契约.md`](docs/S12-设备状态契约.md) | `/tmp` 状态文件的唯一写者表、音量语义、UDP 回传协议 |
 | [`docs/OH2P-刷机评估.md`](docs/OH2P-刷机评估.md) | 小爱音箱 Pro 能不能当耳朵/喇叭，风险几何 |
 | [`docs/家庭智能管家-技术方案.md`](docs/家庭智能管家-技术方案.md) | 总方案：路线对比、延迟预算、合规 |
 | [`docs/P1-实施清单-ESP32S3-N16R8.md`](docs/P1-实施清单-ESP32S3-N16R8.md) | 硬件端点清单：BOM、接线、固件路线（挂起） |
+
+### S12 设备端工具
+
+```sh
+# 交叉编译（必须挂整个 tools/，s12audio 依赖 ../common/*.h）
+docker build -t s12build tools/s12audio
+docker run --rm -v $PWD/tools:/src/tools -w /src/tools/s12audio s12build
+docker run --rm -v $PWD/tools:/src/tools -w /src/tools/s12led   s12build
+
+# 纯逻辑单测（ring / proto / gain / state_file）——宿主机跑
+make -C tools/common test
+
+# 设备侧回归（单测 + 启停 + EVIOCGRAB 释放 + 僵尸检查）
+tools/s12common-regression.sh 192.168.1.3
+```
+
+> 产物是**动态链接 + strip**（`-s`），不是静态二进制：设备上只有
+> `libasound.so.2` / `libspeexdsp.so.1`，没有对应的 `.a`，`-static` 在
+> `ld` 阶段就会失败（已实测）。
+
+`tools/common/` 是 `s12audio` 与 `volumed` 的共享内核，四个头文件都可在宿主机单测：
+
+| 头文件 | 职责 |
+| --- | --- |
+| `gain.h` | pct ↔ 线性增益 ↔ dB ↔ wire byte ↔ 灯弧颗数，全仓唯一曲线 |
+| `ring.h` | 定长 S16 环形缓冲（两段 memcpy、per-ring 溢出计数） |
+| `proto.h` | 下行帧头编解码 + 可中断的 `io_read_full` |
+| `state_file.h` | `/tmp` 状态文件的原子读写（tmp + rename） |
+
+端口：`8765` 上行音频 · `8766` 下行音频 · `8769` UDP 状态回传。**没有 HTTP 观测面**，
+设备侧诊断用 `kill -USR1 <pid>` 打一次 STATS。
 
 ---
 

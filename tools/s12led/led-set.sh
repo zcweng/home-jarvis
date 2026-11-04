@@ -146,7 +146,11 @@ paint_volume() {
         fi
         i=$((i + 1))
     done
-    echo "$pct" > /tmp/jarvis-vol.pct
+    # ❗不要在这里写 /tmp/jarvis-vol.pct。
+    # 契约是「s12audio 是 pct 文件的唯一写者」（见 docs/S12-设备状态契约.md）。
+    # 旧版本在这里回写 pct，而 s12audio 的 playback 线程又轮询同一个文件，
+    # 于是 设备写→设备读→设备再写 形成自激环：滑环时音量会自己往上跑一格。
+    # 音量值由 volumed 在步进后交给 s12audio（经 Mac），状态文件由 s12audio 落盘。
 }
 
 case "$STATE" in

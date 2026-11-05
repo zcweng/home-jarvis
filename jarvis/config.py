@@ -121,10 +121,14 @@ class Settings:
     announce_max_chars: int = 80       # 单条文本上限，超了按句切分
     # 会话
     follow_up_seconds: float = 8.0
-    # 网页搜索（百度 SERP 抓取，无 API key）
+    # 网页搜索（SearXNG + Crawl4AI / local-web-search）
     web_search_enabled: bool = False
     web_search_count: int = 5
-    web_search_timeout: float = 3.0
+    web_search_timeout: float = 8.0
+    web_fetch_timeout: float = 15.0
+    web_fetch_max_chars: int = 3000
+    searxng_base_url: str = "http://127.0.0.1:8888"
+    local_web_search_cache: str = ".cache/local_agentic_search.sqlite3"
     # 天气（中国气象局 weather.cma.cn，无 API key）
     weather_enabled: bool = True
     weather_timeout: float = 3.0
@@ -187,6 +191,10 @@ class Settings:
             web_search_enabled=_env("WEB_SEARCH_ENABLED", "false").lower() in ("1", "true", "yes"),
             web_search_count=_env_int("WEB_SEARCH_COUNT", cls.web_search_count),
             web_search_timeout=_env_float("WEB_SEARCH_TIMEOUT", cls.web_search_timeout),
+            web_fetch_timeout=_env_float("WEB_FETCH_TIMEOUT", cls.web_fetch_timeout),
+            web_fetch_max_chars=_env_int("WEB_FETCH_MAX_CHARS", cls.web_fetch_max_chars),
+            searxng_base_url=_env("SEARXNG_BASE_URL", cls.searxng_base_url),
+            local_web_search_cache=_env("LOCAL_WEB_SEARCH_CACHE", cls.local_web_search_cache),
             weather_enabled=_env("WEATHER_ENABLED", "true").lower() in ("1", "true", "yes"),
             weather_timeout=_env_float("WEATHER_TIMEOUT", cls.weather_timeout),
             weather_default_city=_env("WEATHER_DEFAULT_CITY", cls.weather_default_city),

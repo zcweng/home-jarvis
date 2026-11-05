@@ -41,6 +41,9 @@ debug/
 # uv 本地缓存（本机 ~/.cache 不可写时的替代）
 .uv-cache/
 
+# local-web-search 结果/页面缓存
+.cache/
+
 # 编辑器
 .idea/
 .vscode/

@@ -4,19 +4,19 @@ overview: 用 local-web-search（SearXNG + Crawl4AI）替换百度 SERP 抓取�
 todos:
   - id: rewrite-web-search
     content: Rewrite jarvis/web_search.py as LocalSearchService wrapper (search + fetch); async-safe bridge for Agents loop
-    status: in_progress
+    status: completed
   - id: tools-schemas
     content: Register web_search + web_fetch in tools.py schemas/dispatch (auto-wrapped by agent_tools)
-    status: pending
+    status: completed
   - id: prompt-config
     content: Update prompt.md search→fetch rule; Settings + .env.example
-    status: pending
+    status: completed
   - id: docker-deps
     content: Add searxng to docker-compose; optional [web] extra; gitignore cache
-    status: pending
+    status: completed
   - id: selftest
     content: Rewrite selftest_web_search.py for new backend (mock + optional --live); keep agent force_tool path
-    status: pending
+    status: completed
 isProject: false
 ---
 

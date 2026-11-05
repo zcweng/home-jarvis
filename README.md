@@ -84,15 +84,17 @@ LLM 走 **OpenAI Agents SDK**（Chat Completions 兼容），家电工具仍是�
 ```bash
 git clone https://github.com/zcweng/home-jarvis.git
 cd home-jarvis
-UV_CACHE_DIR=.uv-cache uv sync --extra asr --extra vad --extra kws
+UV_CACHE_DIR=.uv-cache uv sync --extra asr --extra vad --extra kws --extra web
 cp .env.example .env          # 然后填 HA_TOKEN / LLM_API_KEY（或 DEEPSEEK_KEY）
 python3 scripts/preflight.py  # 环境自检：Python/uv/ffmpeg/Docker/语音设备
+# 联网搜索（可选）：首次还需 .venv/bin/crawl4ai-setup
 ```
 
-### 2. 起 Home Assistant
+### 2. 起 Home Assistant（可选一并起 SearXNG）
 
 ```bash
-docker compose -f docker/docker-compose.yml up -d   # → http://localhost:8123 走完初始化
+docker compose -f docker/docker-compose.yml up -d   # HA → :8123；SearXNG → 127.0.0.1:8888
+# 只要搜索：docker compose -f docker/docker-compose.yml up -d searxng
 ```
 
 装官方米家集成见 [`docs/接米家设备-操作手册.md`](docs/接米家设备-操作手册.md)，要点三条：

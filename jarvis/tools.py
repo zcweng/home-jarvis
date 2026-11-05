@@ -336,16 +336,52 @@ class Tools:
     # ---------------------------------------------------------------- 网页搜索
 
     def web_search(self, query: str) -> str:
-        """百度搜索，返回可念的短摘要素材。"""
-        from .web_search import search as baidu_search
+        """SearXNG 搜索，返回带 result_id 的摘要 JSON。"""
+        from .web_search import search as local_search
 
         q = (query or "").strip()
         if not q:
             return "搜索词为空。"
-        return baidu_search(
+        return local_search(
             q,
             count=self.settings.web_search_count,
             timeout=self.settings.web_search_timeout,
+            searxng_base_url=self.settings.searxng_base_url,
+            cache_path=self.settings.local_web_search_cache,
+            fetch_timeout=self.settings.web_fetch_timeout,
+            fetch_max_chars=self.settings.web_fetch_max_chars,
+        )
+
+    def web_fetch(
+        self,
+        result_id: str = "",
+        url: str = "",
+        start: int = 0,
+        max_chars: int | None = None,
+    ) -> str:
+        """按 result_id（或 url）取页面全文切片。"""
+        from .web_search import fetch as local_fetch
+
+        rid = (result_id or "").strip() or None
+        u = (url or "").strip() or None
+        try:
+            start_i = int(start or 0)
+        except (TypeError, ValueError):
+            start_i = 0
+        try:
+            chars = int(max_chars) if max_chars is not None else None
+        except (TypeError, ValueError):
+            chars = None
+        return local_fetch(
+            result_id=rid,
+            url=u,
+            start=start_i,
+            max_chars=chars,
+            searxng_base_url=self.settings.searxng_base_url,
+            search_timeout=self.settings.web_search_timeout,
+            fetch_timeout=self.settings.web_fetch_timeout,
+            fetch_max_chars=self.settings.web_fetch_max_chars,
+            cache_path=self.settings.local_web_search_cache,
         )
 
     # ---------------------------------------------------------------- 天气
@@ -453,7 +489,7 @@ class Tools:
                         "name": "weather",
                         "description": (
                             "查中国城市天气（中国气象局）：实况气温、风力湿度和近几日预报。"
-                            f"用户没说城市时用「{default_city}」。不要用 web_search 查天气。"
+                            f"用户没说城市时用「{default_city}」。不要用 web_search/web_fetch 查天气。"
                         ),
                         "parameters": {
                             "type": "object",
@@ -476,6 +512,7 @@ class Tools:
                         "name": "web_search",
                         "description": (
                             "联网搜索新闻、营业时间、旅游攻略、价格行情等需要实时信息的问题。"
+                            "只返回摘要和 result_id；依赖页面细节前再调 web_fetch。"
                             "查天气请用 weather，不要用本工具。query 用完整中文问句。"
                             "家电控制请用 control/query。"
                         ),
@@ -492,6 +529,41 @@ class Tools:
                     },
                 }
             )
+            out.append(
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "web_fetch",
+                        "description": (
+                            "根据 web_search 返回的 result_id 抓取页面全文切片。"
+                            "在依赖票价、时刻表、长文要点等摘要里没有的细节之前必须调用。"
+                            "优先传 result_id；没有 id 时才直接传 url。"
+                        ),
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "result_id": {
+                                    "type": "string",
+                                    "description": "web_search 结果里的 result_id，例如 res_...",
+                                },
+                                "url": {
+                                    "type": "string",
+                                    "description": "无 result_id 时才用的页面 URL",
+                                },
+                                "start": {
+                                    "type": "integer",
+                                    "description": "正文起始字符偏移，默认 0",
+                                },
+                                "max_chars": {
+                                    "type": "integer",
+                                    "description": "本次最多返回多少字；默认用系统配置",
+                                },
+                            },
+                            "required": [],
+                        },
+                    },
+                }
+            )
         return out
 
     def dispatch(self, name: str, args: dict[str, Any]) -> str:
@@ -502,11 +574,12 @@ class Tools:
             "scene": self.scene,
             "timer": self.timer,
             "web_search": self.web_search,
+            "web_fetch": self.web_fetch,
             "weather": self.weather,
         }.get(name)
         if fn is None:
             return f"没有这个工具：{name}"
-        if name == "web_search" and not self.settings.web_search_enabled:
+        if name in ("web_search", "web_fetch") and not self.settings.web_search_enabled:
             return "网页搜索未启用。"
         if name == "weather" and not self.settings.weather_enabled:
             return "天气查询未启用。"

@@ -126,6 +126,30 @@ kws() {
   echo "❌ 下载失败"; return 1
 }
 
+memory_embed() {
+  # 中文检索向量：bge-small-zh-v1.5（ONNX + tokenizer）
+  # 优先用 Xenova 转换的 onnx；缺省时提示用户自行导出
+  local dir="$MODELS/bge-small-zh-v1.5"
+  mkdir -p "$dir"
+  local repo="Xenova/bge-small-zh-v1.5"
+  # Xenova 仓库结构：onnx/model.onnx + tokenizer.json + config.json
+  if [[ -f "$dir/model.onnx" || -f "$dir/onnx/model.onnx" ]] && [[ -f "$dir/tokenizer.json" ]]; then
+    echo "✅ 已存在，跳过：$dir"
+    return 0
+  fi
+  fetch "$repo" "onnx/model.onnx" "$dir/model.onnx" 20000000 || \
+    fetch "$repo" "onnx/model_O4.onnx" "$dir/model.onnx" 5000000 || true
+  fetch "$repo" "tokenizer.json" "$dir/tokenizer.json" 10000 || true
+  fetch "$repo" "config.json" "$dir/config.json" 100 || true
+  fetch "$repo" "tokenizer_config.json" "$dir/tokenizer_config.json" 50 || true
+  if [[ ! -f "$dir/model.onnx" ]]; then
+    echo "⚠️  bge-small-zh ONNX 未下到，记忆将降级为纯关键词检索"
+    echo "   可手动：huggingface-cli download Xenova/bge-small-zh-v1.5 --local-dir $dir"
+  else
+    ls -lh "$dir"
+  fi
+}
+
 case "${1:-all}" in
   all)
     sense_voice
@@ -137,8 +161,9 @@ case "${1:-all}" in
   kws) kws ;;
   tts) shift || true; tts "$@" ;;
   silero-vad | vad) silero_vad ;;
+  memory | embed | bge) memory_embed ;;
   *)
-    echo "用法：$0 [all|sensevoice|silero-vad]"
+    echo "用法：$0 [all|sensevoice|silero-vad|kws|tts|memory]"
     exit 1
     ;;
 esac

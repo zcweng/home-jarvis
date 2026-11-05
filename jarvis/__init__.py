@@ -17,6 +17,7 @@
     intent.py       命令式意图判定（防「编造已执行」）
     tools.py        家电控制工具契约（HA REST）
     session.py      上下文 / 指代消解
+    memory/         分层记忆（永久 + 短期，可选）
     app.py          状态机
 """
 

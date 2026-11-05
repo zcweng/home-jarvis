@@ -17,8 +17,6 @@ from typing import Any, Callable
 
 import yaml
 
-import time
-
 from .config import ROOT, Settings
 from .ha import HAError, HAClient
 from .output import split_for_speech
@@ -49,6 +47,7 @@ class Tools:
         announce: Callable[[str], None] | None = None,
         settings: Settings | None = None,
         dry_run: bool = False,
+        memory: Any = None,
     ) -> None:
         self.ha = ha
         self._announce = announce  # 定时器到点时本地朗读用
@@ -56,6 +55,10 @@ class Tools:
         self.dry_run = dry_run
         self.devices: dict[str, Device] = self._load(aliases_path)
         self._timers: list[threading.Timer] = []
+        self.memory = memory  # MemoryService | None；timer / memory 工具委托
+
+    def bind_memory(self, memory: Any) -> None:
+        self.memory = memory
 
     # ---------------------------------------------------------------- 加载
 
@@ -296,6 +299,12 @@ class Tools:
         minutes = float(minutes or 0)
         if minutes <= 0 or minutes > 600:
             return "定时的时长必须大于 0 分钟、不超过 600 分钟。"
+        # 记忆开启时走持久化闹钟（重启可恢复）
+        mem = self.memory
+        if mem is not None and getattr(mem, "enabled", False):
+            out = mem.schedule_timer(minutes, label=label or "")
+            if out:
+                return out
         secs = minutes * 60
         # 小于一分钟说"秒"更像人话（"0.0167 分钟"没人这么讲）
         if minutes < 1:
@@ -319,10 +328,35 @@ class Tools:
         self._timers = [x for x in self._timers if x.is_alive()] + [t]
         return f"好，{spoken}后提醒你。"
 
+    def memory_tool(
+        self,
+        action: str,
+        content: str = "",
+        memory_id: str = "",
+        slot: str = "",
+        target: str = "",
+    ) -> str:
+        mem = self.memory
+        if mem is None or not getattr(mem, "enabled", False):
+            return "记忆功能未启用。"
+        return mem.tool_memory(
+            action,
+            content=content or "",
+            memory_id=memory_id or "",
+            slot=slot or "",
+            target=target or "",
+        )
+
     def cancel_timers(self) -> None:
         for t in self._timers:
             t.cancel()
         self._timers.clear()
+        mem = self.memory
+        if mem is not None and getattr(mem, "enabled", False) and getattr(mem, "alarms", None):
+            try:
+                mem.alarms.cancel_all_pending()
+            except Exception:  # noqa: BLE001
+                pass
 
     # ---------------------------------------------------------------- 内部
 
@@ -480,6 +514,35 @@ class Tools:
                 },
             },
         ]
+        if getattr(self.settings, "memory_enabled", False):
+            out.append(
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "memory",
+                        "description": (
+                            "管理分层记忆：remember 记住事实/偏好/规则；forget 忘掉（用户说「忘掉…」时用）；"
+                            "list 列出；correct 纠正冲突事实；recall_alarms 查看待触发提醒。"
+                            "擦除多条或清空全部时，工具会要求用户口头确认。"
+                        ),
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "action": {
+                                    "type": "string",
+                                    "enum": ["remember", "forget", "list", "correct", "recall_alarms"],
+                                    "description": "动作",
+                                },
+                                "content": {"type": "string", "description": "要记住/纠正的内容，或确认语"},
+                                "memory_id": {"type": "string", "description": "记忆 id，形如 m_xxxx"},
+                                "slot": {"type": "string", "description": "槽位，如 food.苹果 / name"},
+                                "target": {"type": "string", "description": "forget 时的自然语言目标"},
+                            },
+                            "required": ["action"],
+                        },
+                    },
+                }
+            )
         if self.settings.weather_enabled:
             default_city = (self.settings.weather_default_city or "成都").strip()
             out.append(
@@ -573,6 +636,7 @@ class Tools:
             "announce": self.announce,
             "scene": self.scene,
             "timer": self.timer,
+            "memory": self.memory_tool,
             "web_search": self.web_search,
             "web_fetch": self.web_fetch,
             "weather": self.weather,
@@ -583,6 +647,8 @@ class Tools:
             return "网页搜索未启用。"
         if name == "weather" and not self.settings.weather_enabled:
             return "天气查询未启用。"
+        if name == "memory" and not getattr(self.settings, "memory_enabled", False):
+            return "记忆功能未启用。"
         try:
             return str(fn(**args))
         except TypeError as e:

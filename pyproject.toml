@@ -34,11 +34,12 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-# 按阶段安装，保持 P0 依赖面最小；装齐用 `uv sync --extra asr --extra vad --extra kws --extra web`
+# 按阶段安装，保持 P0 依赖面最小；装齐用 `uv sync --extra asr --extra vad --extra kws --extra web --extra memory`
 asr = ["sherpa-onnx>=1.10"]      # SenseVoice 识别 + 本地 VITS 合成都走它
 vad = ["onnxruntime>=1.18"]      # silero-vad 断句
 kws = ["pypinyin>=0.51"]         # 专用唤醒词：中文转拼音 token
 web = ["local-web-search>=0.1.6"]  # SearXNG 摘要 + Crawl4AI 全文（另起 docker searxng）
+memory = ["onnxruntime>=1.18"]   # 本地 bge-small-zh 向量召回（tokenizers 已随 agents 带入）
 
 [project.urls]
 Homepage = "https://github.com/zcweng/home-jarvis"

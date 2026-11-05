@@ -44,6 +44,9 @@ debug/
 # local-web-search 结果/页面缓存
 .cache/
 
+# 本地记忆库 / 用户数据（含偏好与提醒，勿提交）
+data/
+
 # 编辑器
 .idea/
 .vscode/

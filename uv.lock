@@ -1366,6 +1366,10 @@ asr = [
 kws = [
     { name = "pypinyin" },
 ]
+memory = [
+    { name = "onnxruntime", version = "1.24.3", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
+    { name = "onnxruntime", version = "1.31.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
+]
 vad = [
     { name = "onnxruntime", version = "1.24.3", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
     { name = "onnxruntime", version = "1.31.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
@@ -1379,6 +1383,7 @@ requires-dist = [
     { name = "httpx", specifier = ">=0.27" },
     { name = "local-web-search", marker = "extra == 'web'", specifier = ">=0.1.6" },
     { name = "numpy", specifier = ">=1.26" },
+    { name = "onnxruntime", marker = "extra == 'memory'", specifier = ">=1.18" },
     { name = "onnxruntime", marker = "extra == 'vad'", specifier = ">=1.18" },
     { name = "openai-agents", specifier = ">=0.24.0" },
     { name = "pypinyin", marker = "extra == 'kws'", specifier = ">=0.51" },
@@ -1387,7 +1392,7 @@ requires-dist = [
     { name = "sounddevice", specifier = ">=0.4.6" },
     { name = "soxr", specifier = ">=0.3.7" },
 ]
-provides-extras = ["asr", "vad", "kws", "web"]
+provides-extras = ["asr", "vad", "kws", "web", "memory"]
 
 [[package]]
 name = "hpack"

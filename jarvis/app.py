@@ -41,6 +41,7 @@ from .endpoint import (
 from .ha import HAClient
 from .intent import looks_like_command, looks_like_weather, looks_like_web_search
 from .agent_runtime import JarvisAgent
+from .memory import MemoryService, MemorySettings, null_service
 from .output import SpeechRouter
 from .session import Session
 from .tools import Tools
@@ -158,6 +159,11 @@ class Jarvis:
         )
         self._audio_label = audio_label
         self.session = Session.load(self.tools.catalog())
+        self.memory = self._build_memory()
+        self.tools.bind_memory(self.memory)
+        if self.memory.enabled:
+            self.session.on_compress = self.memory.maybe_compress_history
+            self.session.max_turns = max(self.session.max_turns, self.st.memory_compress_at_messages // 2)
         if use_fake_llm:
             from .llm_fake import FakeLLM
 
@@ -165,6 +171,9 @@ class Jarvis:
             print("⚠️  使用假模型（只验证编排，不代表模型能力）", file=sys.stderr)
         else:
             self.llm = JarvisAgent(self.st, self.tools, session=self.session)
+            # 记忆分类/摘要复用同一网关（可选 MEMORY_LLM_MODEL）
+            if self.memory.enabled:
+                self.memory._llm = self._make_memory_llm()
         self._here_phrase = "我在"
         self._awake_announced_at = 0.0
         if speak and self._ack_phrases:
@@ -205,6 +214,65 @@ class Jarvis:
 
         speaker = Speaker(self.st.output_device) if self.st.tts_mode == "wav" else None
         return factory, speaker, self.st, f"local:{self.st.input_device or 'default'}"
+
+    def _build_memory(self) -> MemoryService:
+        if not self.st.memory_enabled:
+            return null_service()
+        from .config import ROOT
+
+        ms = MemorySettings(
+            enabled=True,
+            db_path=self.st.memory_db,
+            model_dir=self.st.memory_model_dir,
+            token_budget=self.st.memory_token_budget,
+            short_half_life_days=self.st.memory_short_half_life_days,
+            min_importance=self.st.memory_min_importance,
+            rerank=self.st.memory_rerank,
+            recall_k=self.st.memory_recall_k,
+            episode_every=self.st.memory_episode_every,
+            compress_at_messages=self.st.memory_compress_at_messages,
+            missed_grace=self.st.memory_missed_grace,
+            llm_model=self.st.memory_llm_model,
+        )
+        svc = MemoryService(
+            ms,
+            announce=lambda text: self.tts.speak(text),
+            root=ROOT,
+        )
+        if svc.enabled:
+            print(
+                f"记忆：开 · db={self.st.memory_db} · budget={self.st.memory_token_budget} · "
+                f"half_life={self.st.memory_short_half_life_days:g}d",
+                file=sys.stderr,
+            )
+        return svc
+
+    def _make_memory_llm(self):
+        """给分类器/摘要用的同步 LLM 闭包；失败返回空串。"""
+        st = self.st
+        model = (st.memory_llm_model or st.llm_model).strip()
+        api_key = (st.llm_api_key or st.deepseek_key or "").strip()
+        base = st.llm_base_url.rstrip("/")
+        if not api_key or not model:
+            return None
+
+        def _call(prompt: str) -> str:
+            try:
+                from openai import OpenAI
+
+                client = OpenAI(api_key=api_key, base_url=base, timeout=6.0)
+                resp = client.chat.completions.create(
+                    model=model,
+                    messages=[{"role": "user", "content": prompt}],
+                    temperature=0.0,
+                    max_tokens=400,
+                )
+                return (resp.choices[0].message.content or "").strip()
+            except Exception as e:  # noqa: BLE001
+                print(f"  ⚠️  memory LLM：{e}", file=sys.stderr)
+                return ""
+
+        return _call
 
     def _build_led(self):
         """端点模式且 LED_ENABLED 时接 S12 灯环；否则空操作。"""
@@ -389,7 +457,10 @@ class Jarvis:
         hint = self.llm.call_hint() if hasattr(self.llm, "call_hint") else ""
         print(f"  🔗 LLM 调用：user=「{text}」 {hint}", flush=True)
         try:
-            msgs = self.session.messages(text)
+            memory_block = ""
+            if getattr(self, "memory", None) is not None and self.memory.enabled:
+                memory_block = self.memory.build_context(text)
+            msgs = self.session.messages(text, memory_block=memory_block)
             schemas = self.tools.schemas()
             res = chat_with_guard(
                 self.llm,
@@ -426,6 +497,11 @@ class Jarvis:
 
         self.session.add_user(text)
         self.session.add_assistant(reply)
+        if getattr(self, "memory", None) is not None and self.memory.enabled:
+            try:
+                self.memory.observe_turn(text, reply)
+            except Exception as e:  # noqa: BLE001
+                print(f"  ⚠️  记忆写入入队失败：{e}", file=sys.stderr)
 
         calls = "、".join(c[0] for c in res.tool_results) or "无"
         print(f"  🤖 {reply}   ({res.latency_ms:.0f}ms LLM · {res.rounds} 轮 · 工具 {calls})")
@@ -867,6 +943,12 @@ def main(argv: list[str] | None = None) -> int:
         print("\n再见")
     finally:
         app.tools.cancel_timers()
+        mem = getattr(app, "memory", None)
+        if mem is not None and hasattr(mem, "close"):
+            try:
+                mem.close()
+            except Exception:  # noqa: BLE001
+                pass
         app.ha.close()
         if hasattr(app.llm, "close"):
             app.llm.close()

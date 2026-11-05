@@ -133,6 +133,19 @@ class Settings:
     weather_enabled: bool = True
     weather_timeout: float = 3.0
     weather_default_city: str = "成都"
+    # 分层记忆（本地 SQLite + ONNX；关则行为与现网一致）
+    memory_enabled: bool = False
+    memory_db: str = "data/memory/jarvis_memory.sqlite3"
+    memory_model_dir: str = "models/bge-small-zh-v1.5"
+    memory_token_budget: int = 800
+    memory_short_half_life_days: float = 180.0
+    memory_min_importance: float = 0.45
+    memory_rerank: str = "score"  # score | llm | off
+    memory_recall_k: int = 8
+    memory_llm_model: str = ""  # 空=复用 LLM_MODEL
+    memory_episode_every: int = 6
+    memory_compress_at_messages: int = 24
+    memory_missed_grace: float = 600.0
 
     @classmethod
     def load(cls) -> Settings:
@@ -198,6 +211,22 @@ class Settings:
             weather_enabled=_env("WEATHER_ENABLED", "true").lower() in ("1", "true", "yes"),
             weather_timeout=_env_float("WEATHER_TIMEOUT", cls.weather_timeout),
             weather_default_city=_env("WEATHER_DEFAULT_CITY", cls.weather_default_city),
+            memory_enabled=_env("MEMORY_ENABLED", "false").lower() in ("1", "true", "yes"),
+            memory_db=_env("MEMORY_DB", cls.memory_db),
+            memory_model_dir=_env("MEMORY_MODEL_DIR", cls.memory_model_dir),
+            memory_token_budget=_env_int("MEMORY_TOKEN_BUDGET", cls.memory_token_budget),
+            memory_short_half_life_days=_env_float(
+                "MEMORY_SHORT_HALF_LIFE_DAYS", cls.memory_short_half_life_days
+            ),
+            memory_min_importance=_env_float("MEMORY_MIN_IMPORTANCE", cls.memory_min_importance),
+            memory_rerank=_env("MEMORY_RERANK", cls.memory_rerank),
+            memory_recall_k=_env_int("MEMORY_RECALL_K", cls.memory_recall_k),
+            memory_llm_model=_env("MEMORY_LLM_MODEL", cls.memory_llm_model),
+            memory_episode_every=_env_int("MEMORY_EPISODE_EVERY", cls.memory_episode_every),
+            memory_compress_at_messages=_env_int(
+                "MEMORY_COMPRESS_AT_MESSAGES", cls.memory_compress_at_messages
+            ),
+            memory_missed_grace=_env_float("MEMORY_MISSED_GRACE", cls.memory_missed_grace),
         )
 
     def require_ha(self) -> None:

@@ -165,7 +165,10 @@ python scripts/gen_aliases.py             # 追加写入 config/aliases.yaml（�
 | `LLM_MODEL` / `LLM_BASE_URL` | `deepseek-flash` / DeepSeek | 任意 OpenAI 兼容 Chat Completions 端点 |
 | `MCP_SERVERS` | 空 | 可选 MCP（JSON 数组：`stdio` / `http`），挂到 Agents SDK |
 | `INPUT_DEVICE` / `OUTPUT_DEVICE` | `外置麦克风` / 系统默认 | **按名字子串匹配**，不写索引；未命中回落默认并告警 |
-| `TTS_BACKEND` | `neural` | `neural`=本地 VITS｜`nano`=MOSS-TTS-Nano 侧车（中英混读）｜`say`=系统合成 |
+| `TTS_BACKEND` | `neural` | `neural`=本地 VITS｜`nano`=侧车｜`say`=系统｜`qwen`=千问 Realtime CosyVoice |
+| `TTS_FALLBACK` | `neural` | nano/qwen 失败回落 |
+| `DASHSCOPE_API_KEY` | （空） | 千问平台 API Key；`TTS_BACKEND=qwen` 时必填 |
+| `TTS_QWEN_VOICE` | `longanyang` | 千问 CosyVoice 音色 |
 | `TTS_NANO_URL` | `http://127.0.0.1:8091` | Nano 侧车地址；先 `./scripts/nano_tts_server.sh start --bg` |
 | `TTS_NANO_REF_AUDIO` | `…/zh_1.wav` | Nano 参考音色（默认官方 zh_1） |
 | `TTS_TARGET` | `speaker` | `speaker`=小爱出声｜`local`=电脑喇叭｜`both`=调试（有回声） |
@@ -228,8 +231,8 @@ jarvis/                会话与适配器
   agent_runtime.py     OpenAI Agents SDK（可切换 LLM + 可选 MCP）
   agent_tools.py       Tools → FunctionTool
   llm.py  intent.py    LLMResult 类型 + 「编造已执行」守卫
-  tools.py             工具层：control / query / announce / 定时
-  tts_neural.py tts.py 本地 VITS · macOS say（带音色体检）
+  tools.py             工具层：control / query / announce / 定时 / get_time
+  tts_registry.py tts_neural/nano/qwen/say 可热切换 TTS（含千问 Realtime）
   textnorm.py          数字/单位 → 中文读法
   output.py            SpeechRouter 输出路由
   session.py app.py    状态机 · CLI 入口

@@ -97,10 +97,25 @@ TTS_SPEED=1.0
 
 模型缺文件时会自动回落到 `say` 并打印提示，不会让程序崩。
 
-### 4.2 云 TTS（音质最好、延迟最低，要账号）
+### 4.2 千问 Realtime TTS（云端，可热切换）
 
-接入方式与 `TTS_BACKEND` 同构：新增一个 backend 类，把流式音频喂给 `Speaker`。
-需要你提供：服务商（火山/阿里/腾讯）、AppID/Token、选定发音人。
+走 [千问AI平台 Realtime WebSocket](https://platform.qianwenai.com/docs/api-reference/realtime-api/overview)
+（CosyVoice Inference：`run-task` → `continue-task` → `finish-task`），PCM 流式喂给 `Speaker`。
+
+```bash
+# .env
+TTS_BACKEND=qwen
+DASHSCOPE_API_KEY=sk-...
+TTS_QWEN_MODEL=cosyvoice-v3-flash
+TTS_QWEN_VOICE=longanyang
+TTS_FALLBACK=neural          # 超时/鉴权失败回落本地 VITS
+```
+
+运行中可口令切换（LLM 调 `set_tts`）：
+- 「换成云端音色」→ `set_tts(backend=qwen)`
+- 「切回本地」→ `set_tts(backend=neural)`
+
+冒烟：`.venv/bin/python scripts/try_qwen_tts.py`
 
 ---
 

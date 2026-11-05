@@ -85,7 +85,7 @@ class Settings:
     asr_model_dir: str = "models/sensevoice"
     asr_language: str = "zh"
     # TTS
-    tts_backend: str = "neural"       # neural（本地 VITS）| nano（MOSS-TTS-Nano 侧车）| say
+    tts_backend: str = "neural"       # neural | nano | say | qwen（千问 Realtime）
     tts_model_dir: str = "models/vits-zh-hf-fanchen-C"
     tts_threads: int = 4
     tts_sid: int = 0                  # 多说话人模型选第几个
@@ -93,13 +93,22 @@ class Settings:
     say_rate: int = 170               # macOS say 语速（默认 175 偏快）
     tts_mode: str = "direct"
     tts_voice_say: str = "Tingting"
+    tts_fallback: str = "neural"      # nano/qwen 失败回落：neural | say | none
     # Nano 侧车（./scripts/nano_tts_server.sh；默认不启）
     tts_nano_url: str = "http://127.0.0.1:8091"
     tts_nano_ref_audio: str = "tools/nano-tts/MOSS-TTS-Nano/assets/audio/zh_1.wav"
     tts_nano_stream: bool = True
     tts_nano_timeout: float = 8.0
     tts_nano_speed: float = 1.0
-    tts_nano_fallback: str = "neural"  # neural | say | none
+    tts_nano_fallback: str = "neural"  # 兼容旧键；优先用 TTS_FALLBACK
+    # 千问AI平台 Realtime TTS（CosyVoice WebSocket）
+    dashscope_api_key: str = ""
+    tts_qwen_ws_url: str = "wss://maas.qianwenaiapi.com/api-ws/v1/inference"
+    tts_qwen_model: str = "cosyvoice-v3-flash"
+    tts_qwen_voice: str = "longanyang"
+    tts_qwen_sample_rate: int = 24000
+    tts_qwen_timeout: float = 8.0
+    tts_qwen_speed: float = 1.0
     # VAD
     vad_model: str = "models/silero-vad/silero_vad.onnx"
     vad_threshold: float = 0.5
@@ -180,12 +189,20 @@ class Settings:
             say_rate=_env_int("SAY_RATE", cls.say_rate),
             tts_mode=_env("TTS_MODE", cls.tts_mode),
             tts_voice_say=_env("TTS_VOICE_SAY", cls.tts_voice_say),
+            tts_fallback=_env("TTS_FALLBACK", _env("TTS_NANO_FALLBACK", cls.tts_fallback)),
             tts_nano_url=_env("TTS_NANO_URL", cls.tts_nano_url),
             tts_nano_ref_audio=_env("TTS_NANO_REF_AUDIO", cls.tts_nano_ref_audio),
             tts_nano_stream=_env("TTS_NANO_STREAM", "true").lower() in ("1", "true", "yes"),
             tts_nano_timeout=_env_float("TTS_NANO_TIMEOUT", cls.tts_nano_timeout),
             tts_nano_speed=_env_float("TTS_NANO_SPEED", cls.tts_nano_speed),
             tts_nano_fallback=_env("TTS_NANO_FALLBACK", cls.tts_nano_fallback),
+            dashscope_api_key=_env("DASHSCOPE_API_KEY", cls.dashscope_api_key),
+            tts_qwen_ws_url=_env("TTS_QWEN_WS_URL", cls.tts_qwen_ws_url),
+            tts_qwen_model=_env("TTS_QWEN_MODEL", cls.tts_qwen_model),
+            tts_qwen_voice=_env("TTS_QWEN_VOICE", cls.tts_qwen_voice),
+            tts_qwen_sample_rate=_env_int("TTS_QWEN_SAMPLE_RATE", cls.tts_qwen_sample_rate),
+            tts_qwen_timeout=_env_float("TTS_QWEN_TIMEOUT", cls.tts_qwen_timeout),
+            tts_qwen_speed=_env_float("TTS_QWEN_SPEED", cls.tts_qwen_speed),
             vad_model=_env("VAD_MODEL", cls.vad_model),
             vad_threshold=_env_float("VAD_THRESHOLD", cls.vad_threshold),
             vad_silence_ms=_env_int("VAD_SILENCE_MS", cls.vad_silence_ms),

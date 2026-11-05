@@ -39,7 +39,7 @@ from .endpoint import (
     parse_endpoint,
 )
 from .ha import HAClient
-from .intent import looks_like_command, looks_like_weather, looks_like_web_search
+from .intent import looks_like_command, looks_like_time, looks_like_weather, looks_like_web_search
 from .agent_runtime import JarvisAgent
 from .memory import MemoryService, MemorySettings, null_service
 from .output import SpeechRouter
@@ -65,7 +65,7 @@ def chat_with_guard(
     web_search_enabled: bool = False,
     weather_enabled: bool = False,
 ):
-    """调用模型；命令未调工具 / 天气未查 / 联网问句未搜索时，强制重问一次。
+    """调用模型；命令未调工具 / 天气未查 / 本地时间未查 / 联网问句未搜索时，强制重问一次。
 
     实测模型会凭上下文说"客厅灯已经关了"，却一次没调 control —— 灯根本没动。
     也会直接说「没接天气」而不调工具。prompt 堵不住，编排层兜底。
@@ -78,6 +78,8 @@ def chat_with_guard(
         force = "control"
     elif weather_enabled and looks_like_weather(user_text):
         force = "weather"
+    elif looks_like_time(user_text):
+        force = "get_time"
     elif web_search_enabled and looks_like_web_search(user_text):
         force = "web_search"
     if not force:
@@ -146,9 +148,9 @@ class Jarvis:
         t0 = time.perf_counter()
         self.asr = SenseVoice(self.st.asr_model_dir, language=self.st.asr_language)
         self.vad_model = self.st.vad_model
-        from .tts_neural import build_local_tts
+        from .tts_registry import build_tts
 
-        local_tts = build_local_tts(self.st, self._speaker)
+        local_tts = build_tts(self.st, self._speaker)
         self.ha = HAClient(self.st)
         self.tools = Tools(self.ha, settings=self.st, announce=lambda text: self.tts.speak(text))
         self.tts = SpeechRouter(
@@ -157,6 +159,7 @@ class Jarvis:
             local_tts,
             notify_entity=lambda: self.tools._speaker_notify(),
         )
+        self.tools.bind_tts(local_tts)
         self._audio_label = audio_label
         self.session = Session.load(self.tools.catalog())
         self.memory = self._build_memory()

@@ -50,6 +50,15 @@ _WEATHER = re.compile(
     r"湿度|风力|冷不冷|热不热|适合.*(出门|出去|跑步|运动|洗车|晾|晒))"
 )
 
+# 本地时间/日期（本机时钟）；须排在 web_search 之前，否则「几点了」会被「几点」拖去联网
+_TIME = re.compile(
+    r"((现在|当前).{0,4}(几点|时间|日期|几号|星期几|周几)|"
+    r"(几点了|几点钟了|几时了|几号了|星期几了|周几了)|"
+    r"(今天|现在)(是)?(星期几|周几|几号|几月几号|什么日子)|"
+    r"本地时间|报时)"
+)
+_TIME_EXTERNAL = re.compile(r"(开门|营业|起飞|发车|开场|放映|截止|到点|班次)")
+
 # 需要联网的时效/外部事实（宁可多判；误判只会多一次搜索）
 _WEB = re.compile(
     r"(新闻|头条|热搜|股价|汇率|比分|"
@@ -69,6 +78,19 @@ def looks_like_weather(text: str) -> bool:
     return _WEATHER.search(t) is not None
 
 
+def looks_like_time(text: str) -> bool:
+    """是否像问本机时间/日期/星期（用于强制调 get_time）。"""
+    t = (text or "").strip()
+    if not t:
+        return False
+    if looks_like_command(t):
+        return False
+    # 「电影院几点开门」走联网，不抢成本地时钟
+    if _TIME_EXTERNAL.search(t):
+        return False
+    return _TIME.search(t) is not None
+
+
 def looks_like_web_search(text: str) -> bool:
     """是否像需要联网搜索的问句（用于未调 web_search 时强制重问）。"""
     t = (text or "").strip()
@@ -76,5 +98,8 @@ def looks_like_web_search(text: str) -> bool:
         return False
     # 家电控制优先走 control，不抢成搜索
     if looks_like_command(t):
+        return False
+    # 本地报时优先 get_time
+    if looks_like_time(t):
         return False
     return _WEB.search(t) is not None

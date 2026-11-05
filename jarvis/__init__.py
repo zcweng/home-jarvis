@@ -8,7 +8,10 @@
     kws.py          专用唤醒词（sherpa-onnx KeywordSpotter + 拼音 token）
     wake.py         唤醒门：续聊窗口 / 收线词
     tts.py          语音合成：macOS say（带音色体检）
-    tts_neural.py   语音合成：本地 VITS（默认）
+    tts_neural.py   语音合成：本地 VITS
+    tts_nano.py     MOSS-TTS-Nano 侧车
+    tts_qwen.py     千问 Realtime CosyVoice（WebSocket）
+    tts_registry.py 可热切换装配（neural|nano|say|qwen）
     textnorm.py     数字/单位 → 中文读法（神经 TTS 前置）
     output.py       输出路由：电脑喇叭 / 小爱音箱 / 两边
     llm.py          LLMResult / ToolCall 类型

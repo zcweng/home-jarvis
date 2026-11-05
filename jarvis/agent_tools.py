@@ -1,6 +1,7 @@
 """把 Tools 领域逻辑包装成 Agents SDK FunctionTool。
 
 schema 与 Tools.schemas() 对齐（枚举、描述、必填），避免模型乱填参。
+含 control / query / get_time / weather 等；按 settings 开关过滤。
 control / query 成功后写 session.note_action，供「再暗一点」指代。
 
 注意：工具参数不合法（TypeError）时不能覆盖 session.last，

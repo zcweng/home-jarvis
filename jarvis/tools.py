@@ -1,7 +1,7 @@
-"""家电控制工具契约 —— 大模型能看到的全部世界就这几个函数。
+"""家电与本地工具契约 —— 大模型能看到的全部世界就这些函数。
 
 设计原则（对应方案 §5.4）：
-1. **少而稳**：只有 control / query / scene / timer 四个工具，不给模型自由发挥的空间
+1. **少而稳**：control / query / scene / timer / get_time 等固定集合，不给模型自由发挥的空间
 2. **别名优先**：模型只需输出"客厅灯"这种中文名，实体映射在本地完成，模型不可能编出 entity_id
 3. **结果说人话**：工具返回值就是要念出来的那句确认，避免模型二次创作
 4. **失败不撒谎**：找不到设备/实体离线都返回明确中文，让模型去反问而不是瞎猜
@@ -12,6 +12,7 @@ from __future__ import annotations
 import threading
 import time
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable
 
@@ -20,6 +21,8 @@ import yaml
 from .config import ROOT, Settings
 from .ha import HAError, HAClient
 from .output import split_for_speech
+
+_WEEKDAYS = ("一", "二", "三", "四", "五", "六", "日")
 
 ALIASES_FILE = ROOT / "config" / "aliases.yaml"
 
@@ -56,9 +59,13 @@ class Tools:
         self.devices: dict[str, Device] = self._load(aliases_path)
         self._timers: list[threading.Timer] = []
         self.memory = memory  # MemoryService | None；timer / memory 工具委托
+        self._tts: Any = None  # SwitchableTTS；set_tts 热切换
 
     def bind_memory(self, memory: Any) -> None:
         self.memory = memory
+
+    def bind_tts(self, tts: Any) -> None:
+        self._tts = tts
 
     # ---------------------------------------------------------------- 加载
 
@@ -418,6 +425,29 @@ class Tools:
             cache_path=self.settings.local_web_search_cache,
         )
 
+    # ---------------------------------------------------------------- 本地时间
+
+    def get_time(self) -> str:
+        """本机本地时间（日期+星期+时分），返回可朗读短句。"""
+        now = datetime.now()
+        wd = f"星期{_WEEKDAYS[now.weekday()]}"
+        h = now.hour
+        if h < 6:
+            period, h12 = "凌晨", h if h else 12
+        elif h < 12:
+            period, h12 = "上午", h if h else 12
+        elif h == 12:
+            period, h12 = "中午", 12
+        elif h < 18:
+            period, h12 = "下午", h - 12
+        else:
+            period, h12 = "晚上", h - 12
+        minute = f"{now.minute:02d}"
+        return (
+            f"现在是{now.year}年{now.month}月{now.day}日{wd}，"
+            f"{period}{h12}点{minute}分。"
+        )
+
     # ---------------------------------------------------------------- 天气
 
     def weather(self, city: str = "") -> str:
@@ -428,6 +458,17 @@ class Tools:
         if not c:
             return "请告诉我要查哪个城市。"
         return lookup(c, timeout=self.settings.weather_timeout)
+
+    def set_tts(self, backend: str, voice: str = "", sid: float | None = None) -> str:
+        """运行中切换 TTS 后端 / 音色。"""
+        if self._tts is None or not hasattr(self._tts, "switch"):
+            return "TTS 切换未就绪。"
+        kwargs: dict[str, Any] = {}
+        if voice:
+            kwargs["voice"] = voice
+        if sid is not None:
+            kwargs["sid"] = int(sid)
+        return str(self._tts.switch(backend, **kwargs))
 
     # ---------------------------------------------------------------- 给 LLM 的 schema
 
@@ -510,6 +551,52 @@ class Tools:
                             "label": {"type": "string", "description": "提醒内容，例如「关火」「吃药」"},
                         },
                         "required": ["minutes"],
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "get_time",
+                    "description": (
+                        "查询本机本地时间：现在几点、今天几号、星期几。"
+                        "用户问时间/日期/星期时必须调用；不要凭记忆猜，也不要用 web_search。"
+                        "问商店营业时间、航班时刻等外部时间表请用 web_search，不要用本工具。"
+                    ),
+                    "parameters": {
+                        "type": "object",
+                        "properties": {},
+                        "required": [],
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "set_tts",
+                    "description": (
+                        "切换自己的说话声音/TTS 后端。"
+                        "用户说「换成云端音色」「切回本地」「用 nano」「换成 say」时必须调用；"
+                        "不要只口头答应。"
+                    ),
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "backend": {
+                                "type": "string",
+                                "enum": ["neural", "nano", "say", "qwen"],
+                                "description": "neural=本地VITS；nano=侧车；say=系统；qwen=千问云端",
+                            },
+                            "voice": {
+                                "type": "string",
+                                "description": "可选：say 音色名，或 qwen 音色如 longanyang",
+                            },
+                            "sid": {
+                                "type": "number",
+                                "description": "可选：neural 多说话人编号（0 起）",
+                            },
+                        },
+                        "required": ["backend"],
                     },
                 },
             },
@@ -636,10 +723,12 @@ class Tools:
             "announce": self.announce,
             "scene": self.scene,
             "timer": self.timer,
+            "get_time": self.get_time,
             "memory": self.memory_tool,
             "web_search": self.web_search,
             "web_fetch": self.web_fetch,
             "weather": self.weather,
+            "set_tts": self.set_tts,
         }.get(name)
         if fn is None:
             return f"没有这个工具：{name}"

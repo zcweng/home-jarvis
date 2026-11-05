@@ -78,11 +78,16 @@ class SpeechRouter:
 
     @property
     def voice(self) -> str:
-        return "小爱（云端 TTS）" if self.target in ("speaker", "both") else self.local.voice
+        # speaker/both：米家云端音色；local（含 S12 PCM）：透出当前可切换后端音色
+        if self.target in ("speaker", "both"):
+            return "小爱（云端 TTS）"
+        return getattr(self.local, "voice", "local")
 
     @property
     def mode(self) -> str:
-        return self.target
+        if self.target in ("speaker", "both"):
+            return self.target
+        return getattr(self.local, "mode", self.target)
 
     @property
     def speaking(self) -> bool:

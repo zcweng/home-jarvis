@@ -4,16 +4,16 @@ overview: 把 TTS 收成可热切换的统一后端层：保留 neural/nano/say�
 todos:
   - id: registry
     content: 新增 tts_registry.SwitchableTTS + build_backend/build_tts，改 app 装配点
-    status: pending
+    status: completed
   - id: qwen-realtime
     content: 实现 tts_qwen.QwenRealtimeTTS（千问 Realtime Inference WebSocket + PCM）+ config/.env.example + 依赖
-    status: pending
+    status: completed
   - id: tool-switch
     content: tools.set_tts + prompt 规则 + SpeechRouter 透出当前音色
-    status: pending
+    status: completed
   - id: tests-docs
     content: selftest 热切换/回落；更新 TTS 文档与 README
-    status: pending
+    status: completed
 isProject: false
 ---
 

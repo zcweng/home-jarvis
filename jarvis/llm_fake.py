@@ -104,6 +104,8 @@ class FakeLLM:
             matched = ("", "control", {"device": "@device", "action": "toggle"}, "好的。")
         if matched is None and force_tool == "weather":
             matched = ("", "weather", {"city": ""}, "")
+        if matched is None and force_tool == "get_time":
+            matched = ("", "get_time", {}, "")
         if matched is None and force_tool == "web_search":
             matched = ("", "web_search", {"query": user}, "")
 

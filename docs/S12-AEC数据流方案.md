@@ -829,7 +829,17 @@ struct frame_hdr {          // 小端
 | `1` PCM | 16k mono S16LE | 写环形缓冲 |
 | `2` FLUSH | 空 | 清空缓冲 + 播放静音 + `snd_pcm_drop` |
 | `3` VOLUME | 1 字节（0=-60dB .. 100=0dB） | 更新软件音量系数 |
-| `4` PING | 空 | 回 `PONG`（Mac 侧用它测 RTT） |
+| `4` PING | 空 | 回 `PONG`（Mac 侧播前探活 / 测 RTT） |
+
+**下行连接生命周期（P0）**：
+
+- 设备**同一时刻只服务一条**下行 TCP。新 `accept` 会抢占旧 session（关旧 fd + 清
+  `play_ring` + `FLUSH`），并抽干 backlog 只留最新连接——避免僵尸连接占坑时，
+  Mac `sendall` 成功但 PCM 堆在未读的 Recv-Q 里、喇叭完全无声。
+- TCP keepalive（idle 2s / intvl 1s / cnt 3）：对端崩溃不发 FIN 时约 5s 内踢掉。
+- 应用层空闲 30s 无帧也断开，避免「半活」客户端长期占坑。
+- Mac `EndpointSpeaker.play` 开头 `ensure_alive()`：发 PING 等 PONG；失败则重连
+  再探一次（触发设备抢占），仍失败则放弃播放并打明确错误，不假装「播报成功」。
 
 **为什么下行要帧头而上行不要**：控制消息必须有带内通道，否则 FLUSH 只能靠关连接
 （重连 20~50ms，且 TTS 分句播报会频繁重连）。8 字节开销对 320 字节的 PCM 是 2.5%，可接受。

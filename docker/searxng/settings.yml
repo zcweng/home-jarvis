@@ -1,4 +1,28 @@
-use_default_settings: true
+# 国内直连探活白名单。
+# 注意：360search / sogou wechat / brave.news 在上游默认 disabled:true，
+# keep_only 之后必须再写 disabled:false，否则默认搜索不会调用它们。
+# brave.news 依赖 network:brave，须保留 brave 引擎条目。
+use_default_settings:
+  engines:
+    keep_only:
+      - brave
+      - brave.news
+      - sogou wechat
+      - 360search
+      - bing
+
+engines:
+  - name: 360search
+    disabled: false
+  - name: sogou wechat
+    disabled: false
+  - name: brave.news
+    disabled: false
+  # 只当 brave.news 的 network 父节点；general 搜索易触发 too many requests
+  - name: brave
+    disabled: true
+  - name: bing
+    disabled: false
 
 general:
   instance_name: "home-jarvis"

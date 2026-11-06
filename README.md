@@ -63,7 +63,7 @@ TTS 首字 ~200ms · **端到端首字 ≈1.5s**。
 一个进程、四个可替换适配器（ASR / TTS / LLM / 工具），全部配置驱动；
 设备一律按**中文名子串**匹配，绝不写设备索引（插拔一次索引就变）。
 LLM 走 **OpenAI Agents SDK**（Chat Completions 兼容），家电工具仍是本地 FunctionTool；
-外部数据源可通过 `MCP_SERVERS` 挂 MCP。联网搜索若再升级为 SearXNG/Crawl4AI，应接在 Agents 工具或 MCP 上，而非手写 tool-loop。
+外部数据源可通过 `MCP_SERVERS` 挂 MCP；默认走 Tool Search（`tool_search` + `call_discovered_tool`），MCP/长尾本地工具不进模型前缀，对齐 Anthropic `defer_loading` 语义。`TOOL_SEARCH_ENABLED=false` 可回退全量挂载。
 将来接 ESP32-S3 当远端端点，只替换音频层，状态机与工具层不动。
 
 ---
@@ -163,7 +163,9 @@ python scripts/gen_aliases.py             # 追加写入 config/aliases.yaml（�
 | `HA_TOKEN` / `HA_URL` | — / `http://127.0.0.1:8123` | HA 长期令牌与地址（令牌只在这里，别提交） |
 | `LLM_API_KEY` / `DEEPSEEK_KEY` | — | 优先 `LLM_API_KEY`；未设时回退 `DEEPSEEK_KEY` |
 | `LLM_MODEL` / `LLM_BASE_URL` | `deepseek-flash` / DeepSeek | 任意 OpenAI 兼容 Chat Completions 端点 |
-| `MCP_SERVERS` | 空 | 可选 MCP（JSON 数组：`stdio` / `http`），挂到 Agents SDK |
+| `MCP_SERVERS` | 空 | 可选 MCP（JSON 数组：`stdio` / `http`）；默认经 Tool Search 目录调用 |
+| `TOOL_SEARCH_ENABLED` | true | 客户端 defer：稳定 tools 前缀；false=全量挂载 |
+| `TOOL_SEARCH_DEFER_LOCAL` | web_search,web_fetch,memory | 延迟加载的本地工具名 |
 | `INPUT_DEVICE` / `OUTPUT_DEVICE` | `外置麦克风` / 系统默认 | **按名字子串匹配**，不写索引；未命中回落默认并告警 |
 | `TTS_BACKEND` | `neural` | `neural`=本地 VITS｜`nano`=侧车｜`say`=系统｜`qwen`=千问 Realtime CosyVoice |
 | `TTS_FALLBACK` | `neural` | nano/qwen 失败回落 |

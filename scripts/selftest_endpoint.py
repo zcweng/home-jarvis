@@ -25,7 +25,13 @@ sys.path.insert(0, str(ROOT))
 
 import numpy as np  # noqa: E402
 
-from jarvis.endpoint import FRAME_BYTES, UplinkReader  # noqa: E402
+from jarvis.endpoint import (  # noqa: E402
+    F_PING,
+    FRAME_BYTES,
+    HDR,
+    DownlinkWriter,
+    UplinkReader,
+)
 
 results: list[tuple[str, bool, str]] = []
 
@@ -246,6 +252,118 @@ def test_constants() -> None:
     check("帧长常量一致", FRAME_BYTES == 320, f"FRAME_BYTES={FRAME_BYTES}")
 
 
+class FakeDownlinkDevice:
+    """最小下行端点：accept 后读帧，对 F_PING 回 PONG；可挂起旧连接模拟占坑。"""
+
+    def __init__(self) -> None:
+        self.srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.srv.bind(("127.0.0.1", 0))
+        self.srv.listen(4)
+        self.port = self.srv.getsockname()[1]
+        self.accepted = 0
+        self.pongs = 0
+        self._stop = threading.Event()
+        self._hold_first = False
+        self._sessions: list[threading.Thread] = []
+        self.thread = threading.Thread(target=self._accept_loop, daemon=True)
+        self.thread.start()
+
+    def hold_first_session(self) -> None:
+        """第一条连接只挂起不读——模拟设备旧 session 占坑（P0 抢占前的故障态）。"""
+        self._hold_first = True
+
+    def _accept_loop(self) -> None:
+        self.srv.settimeout(0.2)
+        while not self._stop.is_set():
+            try:
+                c, _ = self.srv.accept()
+            except (socket.timeout, OSError):
+                continue
+            self.accepted += 1
+            idx = self.accepted
+            if self._hold_first and idx == 1:
+                # 占着不读，也不 close；新连接应仍能被后续逻辑服务
+                t = threading.Thread(target=self._hold, args=(c,), daemon=True)
+            else:
+                t = threading.Thread(target=self._serve, args=(c,), daemon=True)
+            self._sessions.append(t)
+            t.start()
+
+    def _hold(self, c: socket.socket) -> None:
+        while not self._stop.is_set():
+            time.sleep(0.05)
+        try:
+            c.close()
+        except OSError:
+            pass
+
+    def _serve(self, c: socket.socket) -> None:
+        c.settimeout(0.3)
+        buf = b""
+        while not self._stop.is_set():
+            try:
+                chunk = c.recv(4096)
+            except socket.timeout:
+                continue
+            except OSError:
+                break
+            if not chunk:
+                break
+            buf += chunk
+            while len(buf) >= 8:
+                typ, _flags, _res, length = HDR.unpack_from(buf, 0)
+                need = 8 + length
+                if len(buf) < need:
+                    break
+                buf = buf[need:]
+                if typ == F_PING:
+                    try:
+                        c.sendall(b"PONG")
+                        self.pongs += 1
+                    except OSError:
+                        return
+        try:
+            c.close()
+        except OSError:
+            pass
+
+    def close(self) -> None:
+        self._stop.set()
+        try:
+            self.srv.close()
+        except OSError:
+            pass
+
+
+def test_downlink_ping_pong() -> None:
+    dev = FakeDownlinkDevice()
+    w = DownlinkWriter("127.0.0.1", dev.port)
+    ok = w.ensure_alive(timeout=1.0)
+    check("下行 PING/PONG 探活", ok and dev.pongs >= 1, f"pongs={dev.pongs}")
+    w.close()
+    dev.close()
+
+
+def test_downlink_ping_fail_reconnect() -> None:
+    """第一条连接被挂起不回 PONG → ensure_alive 应重连到可服务的新 session。"""
+    dev = FakeDownlinkDevice()
+    dev.hold_first_session()
+    w = DownlinkWriter("127.0.0.1", dev.port)
+    # 先占住一条「假活」连接
+    assert w.connect()
+    time.sleep(0.05)
+    before = dev.accepted
+    ok = w.ensure_alive(timeout=0.4)
+    check(
+        "PING 失败后重连拿 PONG",
+        ok and dev.accepted > before and dev.pongs >= 1,
+        f"accepted {before}→{dev.accepted} pongs={dev.pongs}",
+    )
+    w.close()
+    dev.close()
+
+
 def main() -> int:
     print("=" * 60)
     print(" 网络音频端点回归")
@@ -256,6 +374,8 @@ def main() -> int:
     test_pause_during_tts_not_stale()
     test_fin_reconnect()
     test_frame_alignment()
+    test_downlink_ping_pong()
+    test_downlink_ping_fail_reconnect()
 
     print()
     bad = [r for r in results if not r[1]]

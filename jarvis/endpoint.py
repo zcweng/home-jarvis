@@ -71,6 +71,20 @@ def _now() -> float:
     return time.monotonic()
 
 
+def _set_tcp_keepalive(sock: socket.socket) -> None:
+    """与设备端 s12audio 对齐：约 2s 空闲后探测，死连接尽快暴露。"""
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+    if sys.platform == "darwin":
+        # macOS：TCP_KEEPALIVE = 首次探测前的空闲秒数
+        if hasattr(socket, "TCP_KEEPALIVE"):
+            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPALIVE, 2)
+        return
+    for name, val in (("TCP_KEEPIDLE", 2), ("TCP_KEEPINTVL", 1), ("TCP_KEEPCNT", 3)):
+        opt = getattr(socket, name, None)
+        if opt is not None:
+            sock.setsockopt(socket.IPPROTO_TCP, opt, val)
+
+
 # --------------------------------------------------------------------------- 上行收流
 
 
@@ -114,6 +128,7 @@ class UplinkReader:
             self._warn(f"⚠️  上行连接失败 {self.host}:{self.port} — {e}")
             return False
         s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        _set_tcp_keepalive(s)
         s.settimeout(0.05)  # 短超时，攒帧交给外层循环
         self._sock = s
         self._buf.clear()
@@ -192,6 +207,11 @@ class DownlinkWriter:
     """连设备 8766 的下行音频通道，发 framed PCM / FLUSH / VOLUME。
 
     与上行分开连接：FLUSH 必须能立刻发出去，不能被上行的读阻塞拖住。
+
+    P0 可靠性：
+      · TCP keepalive，半开连接尽快失败
+      · ping()/ensure_alive()：播前确认设备真的在读这条连接（收 PONG）
+      · 设备端新连接会抢占旧 session；Mac 重连即可甩掉僵尸坑位
     """
 
     def __init__(self, host: str, port: int = 8766) -> None:
@@ -207,12 +227,15 @@ class DownlinkWriter:
 
     def close(self) -> None:
         with self._lock:
-            if self._sock is not None:
-                try:
-                    self._sock.close()
-                except OSError:
-                    pass
-                self._sock = None
+            self._close_unlocked()
+
+    def _close_unlocked(self) -> None:
+        if self._sock is not None:
+            try:
+                self._sock.close()
+            except OSError:
+                pass
+            self._sock = None
 
     def _send(self, ftype: int, payload: bytes = b"", flags: int = 0) -> bool:
         with self._lock:
@@ -224,11 +247,7 @@ class DownlinkWriter:
                 self._sock.sendall(HDR.pack(ftype, flags, 0, len(payload)) + payload)
                 return True
             except OSError:
-                try:
-                    self._sock.close()
-                except OSError:
-                    pass
-                self._sock = None
+                self._close_unlocked()
                 return False
 
     def _connect_unlocked(self, timeout: float = 3.0) -> bool:
@@ -240,6 +259,7 @@ class DownlinkWriter:
             print(f"⚠️  下行连接失败 {self.host}:{self.port} — {e}", file=sys.stderr)
             return False
         s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        _set_tcp_keepalive(s)
         s.settimeout(2.0)
         self._sock = s
         return True
@@ -261,8 +281,42 @@ class DownlinkWriter:
         """直接发 0–100 音量字节（设备端按 (v-60)/20 dB 解释）。"""
         return self._send(F_VOLUME, bytes([max(0, min(100, int(v))) & 0xFF]))
 
-    def ping(self) -> bool:
-        return self._send(F_PING)
+    def ping(self, timeout: float = 1.0) -> bool:
+        """发 F_PING 并等待设备回 ``PONG``。只确认「当前这条 TCP 被 session 在读」。"""
+        with self._lock:
+            if self._sock is None:
+                if not self._connect_unlocked(timeout=3.0):
+                    return False
+            assert self._sock is not None
+            try:
+                self._sock.sendall(HDR.pack(F_PING, 0, 0, 0))
+                self._sock.settimeout(timeout)
+                buf = b""
+                while len(buf) < 4:
+                    chunk = self._sock.recv(4 - len(buf))
+                    if not chunk:
+                        raise OSError("下行在 PONG 前关闭")
+                    buf += chunk
+                self._sock.settimeout(2.0)
+                return buf == b"PONG"
+            except OSError:
+                self._close_unlocked()
+                return False
+
+    def ensure_alive(self, timeout: float = 1.0) -> bool:
+        """播前探活：PING 失败则强制重连再探一次（触发设备端抢占旧 session）。"""
+        if self.ping(timeout=timeout):
+            return True
+        print(
+            f"⚠️  下行 PING 无响应，重连 {self.host}:{self.port}",
+            file=sys.stderr,
+        )
+        if not self.connect(timeout=max(3.0, timeout)):
+            return False
+        if self.ping(timeout=timeout):
+            return True
+        print("⚠️  下行重连后仍无 PONG", file=sys.stderr)
+        return False
 
 
 # --------------------------------------------------------------------------- 鸭子类型端点
@@ -398,6 +452,9 @@ class EndpointSpeaker:
             with self._play_lock:
                 self._play_depth += 1
             try:
+                if not self.writer.ensure_alive():
+                    print("⚠️  下行未就绪，放弃本次播放", file=sys.stderr)
+                    return
                 block = 640  # 40ms @16k，减少 syscall / 调度抖动
                 prebuffer = int(self.prebuffer_ms * TARGET_RATE / 1000.0)
                 lead = self.lead_ms / 1000.0
@@ -410,7 +467,12 @@ class EndpointSpeaker:
                     if chunk.size < block:
                         chunk = np.pad(chunk, (0, block - chunk.size))
                     if not self.writer.pcm(chunk):
-                        print("⚠️  下行发送失败，放弃本次播放", file=sys.stderr)
+                        delivered_ms = sent / TARGET_RATE * 1000.0
+                        print(
+                            f"⚠️  下行发送失败（已下发 {delivered_ms:.0f}ms / "
+                            f"总长 {pcm.size / TARGET_RATE * 1000.0:.0f}ms），放弃本次播放",
+                            file=sys.stderr,
+                        )
                         return
                     sent += chunk.size
                     if not self._pace or sent < prebuffer:

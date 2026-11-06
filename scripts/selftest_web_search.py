@@ -97,7 +97,7 @@ def main() -> int:
     check("意图：非命令误判", not looks_like_web_search("把吸顶灯关掉"))
     check("意图：闲聊", not looks_like_web_search("你好"))
 
-    st = replace(Settings.load(), web_search_enabled=True)
+    st = replace(Settings.load(), web_search_enabled=True, tool_search_enabled=False)
     try:
         tools = Tools.__new__(Tools)
         tools.settings = st
@@ -106,21 +106,31 @@ def main() -> int:
         tools.dry_run = True
         tools._announce = None
         names = [s["function"]["name"] for s in tools.schemas()]
-        check("schema 含 web_search", "web_search" in names, str(names))
-        check("schema 含 web_fetch", "web_fetch" in names, str(names))
+        check("关闭 tool_search 时 schema 含 web_search", "web_search" in names, str(names))
+        check("关闭 tool_search 时 schema 含 web_fetch", "web_fetch" in names, str(names))
 
         from jarvis.agent_tools import ToolBag, build_function_tools
 
         bag = ToolBag(tools=tools, session=None)
         ft_names = [t.name for t in build_function_tools(bag)]
-        check("FunctionTool 含 web_search", "web_search" in ft_names, str(ft_names))
-        check("FunctionTool 含 web_fetch", "web_fetch" in ft_names, str(ft_names))
+        check("关闭 tool_search 时 FunctionTool 含 web_search", "web_search" in ft_names, str(ft_names))
+        check("关闭 tool_search 时 FunctionTool 含 web_fetch", "web_fetch" in ft_names, str(ft_names))
+
+        st_defer = replace(st, tool_search_enabled=True)
+        tools.settings = st_defer
+        eager = [s["function"]["name"] for s in tools.schemas()]
+        deferred = [s["function"]["name"] for s in tools.deferred_local_schemas()]
+        check("开启 tool_search 时 web_search 不在前缀", "web_search" not in eager, str(eager))
+        check("开启 tool_search 时 web_search 在目录", "web_search" in deferred, str(deferred))
+        bag2 = ToolBag(tools=tools, session=None)
+        ft2 = [t.name for t in build_function_tools(bag2)]
+        check("开启时有元工具", "tool_search" in ft2 and "call_discovered_tool" in ft2, str(ft2))
 
         st_off = replace(st, web_search_enabled=False)
         tools.settings = st_off
         names_off = [s["function"]["name"] for s in tools.schemas()]
-        check("关闭时无 web_search", "web_search" not in names_off)
-        check("关闭时无 web_fetch", "web_fetch" not in names_off)
+        check("关闭 web 时无 web_search", "web_search" not in names_off)
+        check("关闭 web 时无 web_fetch", "web_fetch" not in names_off)
     except Exception as e:  # noqa: BLE001
         check("schema 注册", False, str(e))
 

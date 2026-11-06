@@ -34,6 +34,9 @@
 //   g_vol_pct   只被 playback 线程写（它也是 /tmp/jarvis-vol.pct 的唯一写者）
 //   g_mic_muted 只被 playback 线程轮询后写；uplink 只读
 //   g_mic_mute_seen 只被 playback 线程读写（旧实现被两个线程同时调用，见 2026-11-04 审查）
+//
+// 下行连接（P0）：同一时刻只服务一条 TCP。新连接抢占旧 session（关旧 fd + 清
+// play_ring + FLUSH）；TCP keepalive + 30s 应用空闲超时踢死半开/占坑连接。
 // ===========================================================================
 
 #define _GNU_SOURCE
@@ -485,9 +488,25 @@ static int tcp_listen(int port) {
   return fd;
 }
 
-static void set_send_timeout(int fd) {
+/* 下行无应用数据多久后踢掉会话。跟 keepalive 互补：
+ * keepalive 杀「对端已死但 TCP 半开」；本超时杀「对端还活着但长期不发帧、
+ * 占着唯一下行 session」——否则新 Mac 连上来只能堵在 accept 队列。 */
+#define DOWN_IDLE_MS 30000
+
+static void set_tcp_client_opts(int fd) {
   int one = 1;
   setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+  /* keepalive：WiFi 闪断 / 对端崩溃不发 FIN 时，~2+1×3 ≈ 5s 内让 recv 失败，
+     释放唯一的下行 session，避免僵尸连接占坑。 */
+  setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &one, sizeof(one));
+#ifdef TCP_KEEPIDLE
+  {
+    int idle = 2, intvl = 1, cnt = 3;
+    setsockopt(fd, IPPROTO_TCP, TCP_KEEPIDLE, &idle, sizeof(idle));
+    setsockopt(fd, IPPROTO_TCP, TCP_KEEPINTVL, &intvl, sizeof(intvl));
+    setsockopt(fd, IPPROTO_TCP, TCP_KEEPCNT, &cnt, sizeof(cnt));
+  }
+#endif
   /* send 必须带超时：否则客户端读得慢（或断开未被探测）时，
      send 会阻塞几十秒，上行线程停摆，ring 迅速溢出。 */
   struct timeval tv;
@@ -522,7 +541,7 @@ static void *uplink_thread(void *arg) {
     if (poll(&p, 1, 200) <= 0) continue;
     int cfd = accept(lfd, NULL, NULL);
     if (cfd < 0) continue;
-    set_send_timeout(cfd);
+    set_tcp_client_opts(cfd);
     logf_("上行已连接");
     ring_clear(&g_up_ring);
 
@@ -545,14 +564,61 @@ static void *uplink_thread(void *arg) {
   return NULL;
 }
 
-/* 下行会话：解析帧 → 写 play_ring / 请求 FLUSH / 更新音量。
- * 这里**不碰** g_pcm_play，所有 ALSA 操作归 playback 线程（见文件头所有权表）。 */
-static void downlink_session(int cfd, char **payload_buf, size_t *payload_cap) {
+/* listen 上是否已有完成握手、等待 accept 的新连接。 */
+static int listen_pending(int lfd) {
+  struct pollfd p;
+  p.fd = lfd;
+  p.events = POLLIN;
+  p.revents = 0;
+  return poll(&p, 1, 0) > 0 && (p.revents & POLLIN);
+}
+
+/* 一次 accept，并抽干 backlog，只保留最新一条（旧连接直接丢掉）。
+ * 场景：Mac 多次重连而设备还卡在旧 session 上时，队列里会堆多条 ESTABLISHED，
+ * Recv-Q 里塞满 PCM，但唯一的下行线程读的还是旧 fd → Mac「播报成功」设备无声。 */
+static int accept_latest(int lfd) {
+  int cfd = accept(lfd, NULL, NULL);
+  if (cfd < 0) return -1;
   for (;;) {
+    if (!listen_pending(lfd)) break;
+    int nc = accept(lfd, NULL, NULL);
+    if (nc < 0) break;
+    close(cfd);
+    cfd = nc;
+  }
+  return cfd;
+}
+
+static void downlink_takeover_flush(void) {
+  ring_clear(&g_play_ring);
+  g_flush_req = 1; /* playback 线程 drop+prepare，丢掉旧音频 */
+}
+
+/* 下行会话：解析帧 → 写 play_ring / 请求 FLUSH / 更新音量。
+ * 这里**不碰** g_pcm_play，所有 ALSA 操作归 playback 线程（见文件头所有权表）。
+ *
+ * lfd 一并传入：session 期间若有新连接到来，立刻让出（抢占），由线程循环
+ * accept 最新连接。同一时刻只服务一条下行。 */
+static void downlink_session(int cfd, int lfd, char **payload_buf, size_t *payload_cap) {
+  int idle_ms = 0;
+  for (;;) {
+    if (listen_pending(lfd)) {
+      logf_("下行被新连接抢占");
+      return;
+    }
+
     frame_hdr_t h;
     io_result_t r = io_read_full(cfd, &h, sizeof(h), &g_stop, 300);
-    if (r == IO_TIMEOUT) continue;
+    if (r == IO_TIMEOUT) {
+      idle_ms += 300;
+      if (idle_ms >= DOWN_IDLE_MS) {
+        logf_("下行空闲超时 %ds，断开", DOWN_IDLE_MS / 1000);
+        return;
+      }
+      continue;
+    }
     if (r != IO_OK) return;
+    idle_ms = 0;
 
     uint32_t len = hdr_get_length(&h);
     if (len > PROTO_MAX_PAYLOAD) {
@@ -566,6 +632,10 @@ static void downlink_session(int cfd, char **payload_buf, size_t *payload_cap) {
       *payload_cap = len;
     }
     if (len > 0) {
+      if (listen_pending(lfd)) {
+        logf_("下行被新连接抢占");
+        return;
+      }
       r = io_read_full(cfd, *payload_buf, len, &g_stop, 1000);
       if (r != IO_OK) return;
     }
@@ -603,11 +673,12 @@ static void *downlink_thread(void *arg) {
   while (!g_stop) {
     struct pollfd p = {lfd, POLLIN, 0};
     if (poll(&p, 1, 200) <= 0) continue;
-    int cfd = accept(lfd, NULL, NULL);
+    int cfd = accept_latest(lfd);
     if (cfd < 0) continue;
-    set_send_timeout(cfd);
+    set_tcp_client_opts(cfd);
+    downlink_takeover_flush();
     logf_("下行已连接");
-    downlink_session(cfd, &payload, &pcap);
+    downlink_session(cfd, lfd, &payload, &pcap);
     close(cfd);
     logf_("下行断开，等待重连");
   }

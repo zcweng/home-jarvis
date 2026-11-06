@@ -106,7 +106,8 @@ class FakeLLM:
             matched = ("", "weather", {"city": ""}, "")
         if matched is None and force_tool == "get_time":
             matched = ("", "get_time", {}, "")
-        if matched is None and force_tool == "web_search":
+        if matched is None and force_tool in ("web_search", "tool_search"):
+            # FakeLLM 无目录路由：直接调 web_search；真路径由 JarvisAgent 走 tool_search
             matched = ("", "web_search", {"query": user}, "")
 
         if matched is None:

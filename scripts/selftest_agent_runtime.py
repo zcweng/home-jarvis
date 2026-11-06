@@ -103,13 +103,18 @@ class MockProvider:
         self._srv.shutdown()
 
 
+_call_seq = 0
+
+
 def _call(name: str, args: dict[str, Any]) -> dict[str, Any]:
+    global _call_seq
+    _call_seq += 1
     return {
         "role": "assistant",
         "content": None,
         "tool_calls": [
             {
-                "id": "c1",
+                "id": f"c{_call_seq}",
                 "type": "function",
                 "function": {"name": name, "arguments": json.dumps(args, ensure_ascii=False)},
             }
@@ -121,7 +126,14 @@ def _has_tool_result(body: dict[str, Any]) -> bool:
     return any(m.get("role") == "tool" for m in body.get("messages") or [])
 
 
-def make_agent(url: str, *, mcp: str = "", provider: str = "openai_compatible", timeout: float = 10.0):
+def make_agent(
+    url: str,
+    *,
+    mcp: str = "",
+    provider: str = "openai_compatible",
+    timeout: float = 10.0,
+    tool_search_enabled: bool = True,
+):
     st = Settings.load()
     st = Settings(
         **{
@@ -134,6 +146,7 @@ def make_agent(url: str, *, mcp: str = "", provider: str = "openai_compatible", 
             "mcp_servers": mcp,
             "web_search_enabled": False,
             "weather_enabled": False,
+            "tool_search_enabled": tool_search_enabled,
         }
     )
     ha = FakeHA()
@@ -171,12 +184,13 @@ def test_error_mapping() -> None:
         agent.close()
         p.close()
 
-    # 连不上 → httpx.TransportError（app 的既有分支能接住）
-    agent, *_ = make_agent("http://127.0.0.1:1/v1")
+    # 连不上 → httpx.TransportError / TimeoutException（app 的既有分支能接住）
+    # 避免 127.0.0.1:1 在部分 macOS 上超时或被中间层吞成奇怪状态码
+    agent, *_ = make_agent("http://invalid.home-jarvis.test:59999/v1", timeout=2.0)
     try:
         agent.chat([{"role": "user", "content": "hi"}])
         check("连接失败抛异常", False, "没抛")
-    except httpx.TransportError:
+    except (httpx.TransportError, httpx.TimeoutException):
         check("连接失败归一化成 TransportError", True)
     except BaseException as e:  # noqa: BLE001
         check("连接失败归一化成 TransportError", False, f"{type(e).__name__}: {e}")
@@ -349,7 +363,7 @@ def test_fake_llm_device_pick() -> None:
 
 
 def test_mcp_multi_turn() -> None:
-    print("\n⑤ MCP 连续多轮可用")
+    print("\n⑤ MCP 经 tool_search 连续多轮可用")
 
     server_py = ROOT / "debug" / "_mcp_echo_probe.py"
     server_py.parent.mkdir(parents=True, exist_ok=True)
@@ -370,23 +384,37 @@ def test_mcp_multi_turn() -> None:
     )
 
     def handler(body, _n):
-        if not _has_tool_result(body):
-            return 200, _call("echo", {"text": "嗨"})
-        last = [m for m in body.get("messages") or [] if m.get("role") == "tool"][-1]
-        return 200, {"role": "assistant", "content": f"工具说：{last.get('content')}"}
+        # 每轮：search → call_discovered → 终答
+        msgs = body.get("messages") or []
+        tool_msgs = [m for m in msgs if m.get("role") == "tool"]
+        if not tool_msgs:
+            return 200, _call("tool_search", {"query": "回显 echo"})
+        texts = [str(m.get("content") or "") for m in tool_msgs]
+        if any("ECHO:" in t for t in texts):
+            last_echo = next(t for t in reversed(texts) if "ECHO:" in t)
+            return 200, {"role": "assistant", "content": f"工具说：{last_echo}"}
+        if any("discovered" in t for t in texts):
+            return 200, _call(
+                "call_discovered_tool",
+                {"name": "echo", "arguments": {"text": "嗨"}},
+            )
+        return 200, {"role": "assistant", "content": f"工具说：{texts[-1]}"}
 
     p = MockProvider(handler)
-    agent, *_ = make_agent(p.url, mcp=cfg, timeout=20.0)
+    agent, *_ = make_agent(p.url, mcp=cfg, timeout=20.0, tool_search_enabled=True)
     try:
+        # echo 不应出现在 eager tools 前缀里
+        eager = {t.name for t in agent._function_tools}
+        check("MCP echo 不在 eager 前缀", "echo" not in eager, str(sorted(eager)))
         outs = []
         for i in range(3):
             res = agent.chat([{"role": "user", "content": f"第 {i + 1} 次回显"}])
             outs.append(res.text)
         ok = all("ECHO:嗨" in o for o in outs)
-        check("MCP 连续 3 轮都能调到", ok, " | ".join(o[:36] for o in outs))
+        check("MCP 经 search/call 连续 3 轮", ok, " | ".join(o[:36] for o in outs))
         check("MCP 失败时不吞成「运行出错」", all("running the tool" not in o for o in outs), str(outs))
     except BaseException as e:  # noqa: BLE001
-        check("MCP 连续 3 轮都能调到", False, f"{type(e).__name__}: {e}")
+        check("MCP 经 search/call 连续 3 轮", False, f"{type(e).__name__}: {e}")
     finally:
         agent.close()
         p.close()

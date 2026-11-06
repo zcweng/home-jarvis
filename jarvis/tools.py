@@ -472,7 +472,15 @@ class Tools:
 
     # ---------------------------------------------------------------- 给 LLM 的 schema
 
-    def schemas(self) -> list[dict[str, Any]]:
+    def defer_local_names(self) -> set[str]:
+        """tool_search 开启时，这些本地工具不进模型前缀，只进目录。"""
+        if not getattr(self.settings, "tool_search_enabled", False):
+            return set()
+        raw = getattr(self.settings, "tool_search_defer_local", "") or ""
+        return {x.strip() for x in raw.split(",") if x.strip()}
+
+    def _schemas_all(self) -> list[dict[str, Any]]:
+        """全部已启用本地工具（含将 defer 的），供目录索引。"""
         out: list[dict[str, Any]] = [
             {
                 "type": "function",
@@ -714,6 +722,33 @@ class Tools:
                     },
                 }
             )
+        return out
+
+    def schemas(self) -> list[dict[str, Any]]:
+        """模型可见的 eager 工具；defer 本地工具已剔除。"""
+        defer = self.defer_local_names()
+        if not defer:
+            return self._schemas_all()
+        out: list[dict[str, Any]] = []
+        for spec in self._schemas_all():
+            fn = spec.get("function") or {}
+            name = str(fn.get("name") or "")
+            if name in defer:
+                continue
+            out.append(spec)
+        return out
+
+    def deferred_local_schemas(self) -> list[dict[str, Any]]:
+        """启用且 defer 的本地工具 schema（进 ToolCatalog，不进前缀）。"""
+        defer = self.defer_local_names()
+        if not defer:
+            return []
+        out: list[dict[str, Any]] = []
+        for spec in self._schemas_all():
+            fn = spec.get("function") or {}
+            name = str(fn.get("name") or "")
+            if name in defer:
+                out.append(spec)
         return out
 
     def dispatch(self, name: str, args: dict[str, Any]) -> str:

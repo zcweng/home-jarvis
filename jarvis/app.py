@@ -81,6 +81,7 @@ def chat_with_guard(
     elif looks_like_time(user_text):
         force = "get_time"
     elif web_search_enabled and looks_like_web_search(user_text):
+        # JarvisAgent 若开启 tool_search 且 web_search 已 defer，会把 force 改成 tool_search
         force = "web_search"
     if not force:
         return res

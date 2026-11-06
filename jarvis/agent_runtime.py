@@ -213,7 +213,13 @@ class JarvisAgent:
         if not self._provider:
             self._provider = "deepseek" if "deepseek" in self.base_url.lower() else "openai_compatible"
 
-        self._bag = ToolBag(tools=tools, session=session)
+        self._tool_search = bool(getattr(st, "tool_search_enabled", False))
+        self._bag = ToolBag(
+            tools=tools,
+            session=session,
+            tool_search_limit=int(getattr(st, "tool_search_limit", 5) or 5),
+        )
+        self._refresh_local_catalog()
         self._function_tools = build_function_tools(self._bag)
         self._mcp_servers = _build_mcp_servers(_parse_mcp_servers(st.mcp_servers))
         self._active_mcp: list[Any] = []
@@ -238,6 +244,13 @@ class JarvisAgent:
             model_settings=self._model_settings(),
         )
         self._loop = _LoopThread()
+
+    def _refresh_local_catalog(self) -> None:
+        """把 defer 本地工具写入目录（MCP 条目在 connect 后追加）。"""
+        if not self._tool_search:
+            return
+        self._bag.catalog.remove_source("local")
+        self._bag.catalog.add_local_schemas(self._bag.tools.deferred_local_schemas(), defer=True)
 
     def bind_session(self, session: Session) -> None:
         self._bag.session = session
@@ -274,7 +287,11 @@ class JarvisAgent:
     # ------------------------------------------------------------------ MCP
 
     def _ensure_mcp(self) -> None:
-        """连接 MCP；单个失败只降级，不让整个管家起不来。"""
+        """连接 MCP；单个失败只降级，不让整个管家起不来。
+
+        tool_search 开启时：MCP 只作上游执行后端，工具进目录不挂到 Agent。
+        关闭时：仍把 MCP 全量挂到 Agent（旧行为）。
+        """
         if self._mcp_connected or not self._mcp_servers:
             return
         self._mcp_connected = True
@@ -297,8 +314,26 @@ class JarvisAgent:
         except Exception as e:  # noqa: BLE001
             _warn(f"MCP 连接异常，本轮不挂 MCP：{e}")
             self._active_mcp = []
+        self._bag.mcp_servers = list(self._active_mcp)
+        if self._tool_search and self._active_mcp:
+            try:
+                self._loop.submit(self._index_mcp_tools(), timeout=MCP_CONNECT_TIMEOUT)
+            except Exception as e:  # noqa: BLE001
+                _warn(f"MCP 工具索引入目录失败：{e}")
+        mode = "目录检索" if self._tool_search else "全量挂载"
         names = "、".join(str(s.name) for s in self._active_mcp) or "无"
-        print(f"  🔌 MCP：{len(self._active_mcp)}/{len(self._mcp_servers)} 已连接（{names}）", file=sys.stderr)
+        print(
+            f"  🔌 MCP：{len(self._active_mcp)}/{len(self._mcp_servers)} 已连接（{names}，{mode}）",
+            file=sys.stderr,
+        )
+
+    async def _index_mcp_tools(self) -> None:
+        for s in self._active_mcp:
+            try:
+                tools = await s.list_tools()
+                self._bag.catalog.add_mcp_tools(str(s.name), tools)
+            except Exception as e:  # noqa: BLE001
+                _warn(f"MCP「{s.name}」list_tools 失败：{e}")
 
     async def _cleanup_mcp(self) -> None:
         for s in self._active_mcp:
@@ -411,10 +446,12 @@ class JarvisAgent:
         hooks: _EarlyAckHooks,
         t0: float,
     ) -> LLMResult:
+        # tool_search 开启时 MCP 不进 Agent 前缀；关闭时保持全量挂载
+        mcp_for_agent = [] if self._tool_search else list(self._active_mcp)
         agent = self._agent.clone(
             instructions=instructions,
             model_settings=self._model_settings(temperature=temperature, force_tool=force_tool),
-            mcp_servers=list(self._active_mcp),
+            mcp_servers=mcp_for_agent,
         )
         try:
             run_result = await Runner.run(
@@ -445,15 +482,17 @@ class JarvisAgent:
         messages: list[dict[str, Any]],
         tools: list[dict[str, Any]] | None = None,  # noqa: ARG002 — 兼容旧调用方
         dispatch=None,  # noqa: ARG002 — 真实路径走 FunctionTool；FakeLLM 仍用 dispatch
-        max_rounds: int = 3,
+        max_rounds: int = 4,
         temperature: float = 0.3,
         force_tool: str | None = None,
         on_tool_calls: Callable[[list[ToolCall]], None] | None = None,
     ) -> LLMResult:
         t0 = time.perf_counter()
-        self._bag.last_results.clear()
-        self._bag.collected_calls.clear()
+        self._bag.reset_turn()
         self._ensure_mcp()
+        # 意图强制到已 defer 的本地工具时，改为强制 tool_search
+        if self._tool_search and force_tool and force_tool in self._bag.tools.defer_local_names():
+            force_tool = "tool_search"
 
         instructions, input_items = self._messages_to_input(messages)
         hooks = _EarlyAckHooks(on_tool_calls, self._bag.collected_calls)

@@ -67,6 +67,10 @@ class Settings:
     llm_disable_thinking: bool = False  # 强制给请求带 thinking.disabled
     # MCP：JSON 数组，如 [{"type":"stdio","command":"npx","args":["-y","@modelcontextprotocol/server-filesystem","/tmp"]}]
     mcp_servers: str = ""
+    # Tool Search（客户端 defer_loading）：稳定 tools 前缀 + 检索后注入
+    tool_search_enabled: bool = True
+    tool_search_defer_local: str = "web_search,web_fetch,memory"
+    tool_search_limit: int = 5
     # 音频
     input_device: str = "外置麦克风"
     output_device: str = "MacBook Pro扬声器"
@@ -170,6 +174,11 @@ class Settings:
             llm_provider=_env("LLM_PROVIDER", cls.llm_provider),
             llm_disable_thinking=_env("LLM_DISABLE_THINKING", "false").lower() in ("1", "true", "yes"),
             mcp_servers=_env("MCP_SERVERS", cls.mcp_servers),
+            tool_search_enabled=_env("TOOL_SEARCH_ENABLED", "true").lower() in ("1", "true", "yes"),
+            tool_search_defer_local=_env(
+                "TOOL_SEARCH_DEFER_LOCAL", cls.tool_search_defer_local
+            ),
+            tool_search_limit=_env_int("TOOL_SEARCH_LIMIT", cls.tool_search_limit),
             input_device=_env("INPUT_DEVICE", cls.input_device),
             output_device=_env("OUTPUT_DEVICE", cls.output_device),
             audio_source=_env("AUDIO_SOURCE", cls.audio_source),

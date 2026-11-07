@@ -159,6 +159,7 @@ class Settings:
     memory_episode_every: int = 6
     memory_compress_at_messages: int = 24
     memory_missed_grace: float = 600.0
+    memory_alarm_retention_days: float = 7.0
 
     @classmethod
     def load(cls) -> Settings:
@@ -253,6 +254,9 @@ class Settings:
                 "MEMORY_COMPRESS_AT_MESSAGES", cls.memory_compress_at_messages
             ),
             memory_missed_grace=_env_float("MEMORY_MISSED_GRACE", cls.memory_missed_grace),
+            memory_alarm_retention_days=_env_float(
+                "MEMORY_ALARM_RETENTION_DAYS", cls.memory_alarm_retention_days
+            ),
         )
 
     def require_ha(self) -> None:

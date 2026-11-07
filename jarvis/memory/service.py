@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 
-from .alarms import AlarmScheduler, parse_relative_minutes
+from .alarms import AlarmScheduler, normalize_fire_at, parse_at, parse_relative_minutes
 from .classifier import classify
 from .decay import should_archive
 from .digest import MemoryDigest
@@ -43,6 +43,7 @@ class MemorySettings:
     episode_every: int = 6
     compress_at_messages: int = 24
     missed_grace: float = 600.0
+    alarm_retention_days: float = 7.0
     llm_model: str = ""  # 覆盖分类/摘要模型名（由外部 llm 闭包处理）
 
 
@@ -136,6 +137,7 @@ class MemoryService:
                 announce=announce,
                 writer=self.writer,
                 missed_grace=settings.missed_grace,
+                retention_days=settings.alarm_retention_days,
             )
             self.alarms.start()
             self._worker = threading.Thread(target=self._run_worker, name="jarvis-memory", daemon=True)
@@ -263,41 +265,213 @@ class MemoryService:
                 return f"已纠正（{r.action}）。"
             return "纠正失败。"
         if action == "recall_alarms":
-            if not self.alarms:
-                return "无闹钟服务。"
-            pending = self.alarms.list_pending()
-            if not pending:
-                return "没有待触发的提醒。"
-            lines = []
-            for a in pending[:20]:
-                ts = time.strftime("%Y-%m-%d %H:%M", time.localtime(float(a["fire_at"])))
-                lines.append(f"[{a['id']}] {ts} {a.get('label') or ''} ({a.get('repeat_rule')})")
-            return "\n".join(lines)
+            return self.list_reminders()
         return f"不支持的 memory action：{action}"
 
+    def list_reminders(self) -> str:
+        if not self.enabled or not self.alarms:
+            return "无闹钟服务。"
+        pending = self.alarms.list_pending()
+        if not pending:
+            return "没有待触发的提醒。"
+        lines = []
+        for a in pending[:20]:
+            ts = time.strftime("%Y-%m-%d %H:%M", time.localtime(float(a["fire_at"])))
+            lines.append(f"[{a['id']}] {ts} {a.get('label') or ''} ({a.get('repeat_rule')})")
+        return "\n".join(lines)
+
     def schedule_timer(self, minutes: float, label: str = "") -> str:
-        """供 Tools.timer 委托。"""
+        """兼容旧入口：相对分钟 once。"""
+        return self.schedule_reminder(minutes=minutes, label=label, repeat="once")
+
+    def schedule_reminder(
+        self,
+        *,
+        minutes: float | None = None,
+        at: str | None = None,
+        label: str = "",
+        repeat: str = "once",
+    ) -> str:
+        """供 Tools.timer 委托：相对或绝对时间，支持 once/daily/weekly。"""
         if not self.enabled or not self.alarms or not self.writer:
             return ""
-        # 同步写一条 task 永久记忆
+        repeat = (repeat or "once").lower()
+        if repeat not in ("once", "daily", "weekly"):
+            return f"不支持的重复规则：{repeat}。"
+
+        at_s = (at or "").strip()
+        label = (label or "").strip()
+        fire_at: float | None = None
+        content = label
+
+        if at_s:
+            try:
+                fire_at = normalize_fire_at(parse_at(at_s), repeat)
+            except ValueError as e:
+                msg = str(e)
+                return msg if "未来" in msg or "重复" in msg else f"时间无效：{e}"
+            when = time.strftime("%Y-%m-%d %H:%M", time.localtime(fire_at))
+            content = label or f"{when} 提醒"
+            draft = ClassifyResult(
+                should_store=True,
+                layer="perm",
+                type="task",
+                slot="task.reminder",
+                content=content,
+                summary=content,
+                importance=0.85,
+                tags=["task", "timer"],
+                schedule={"at": at_s, "hint": label, "repeat": repeat},
+            )
+            wr = self.writer.write(draft, session_id=self.session_id, source="timer")
+            aid = self.alarms.schedule_at(
+                fire_at, label=label or content, repeat_rule=repeat, memory_id=wr.memory_id
+            )
+            if repeat == "daily":
+                return f"好，从 {when} 起每天提醒你。[{aid}]"
+            if repeat == "weekly":
+                return f"好，从 {when} 起每周提醒你。[{aid}]"
+            return f"好，{when}提醒你。[{aid}]"
+
+        if minutes is None or float(minutes) <= 0:
+            return "请提供 minutes 或 at。"
+        minutes_f = float(minutes)
+        content = label or f"{minutes_f:g} 分钟后提醒"
         draft = ClassifyResult(
             should_store=True,
             layer="perm",
             type="task",
             slot="task.reminder",
-            content=label or f"{minutes:g} 分钟后提醒",
-            summary=label or f"{minutes:g} 分钟后提醒",
+            content=content,
+            summary=content,
             importance=0.85,
             tags=["task", "timer"],
-            schedule={"hint": label, "repeat": "once"},
+            schedule={"hint": label, "repeat": repeat},
         )
         wr = self.writer.write(draft, session_id=self.session_id, source="timer")
-        self.alarms.schedule_in(minutes, label=label, memory_id=wr.memory_id)
-        if minutes < 1:
-            spoken = f"{round(minutes * 60):g} 秒"
+        aid, fire_at = self.alarms.schedule_in(
+            minutes_f, label=label, memory_id=wr.memory_id, repeat_rule=repeat
+        )
+        # relative + daily/weekly：首次在 minutes 后响，之后按规则滚
+        if minutes_f < 1:
+            spoken = f"{round(minutes_f * 60):g} 秒"
         else:
-            spoken = f"{minutes:g} 分钟"
-        return f"好，{spoken}后提醒你。"
+            spoken = f"{minutes_f:g} 分钟"
+        if repeat == "daily":
+            return f"好，{spoken}后开始提醒你，之后每天。[{aid}]"
+        if repeat == "weekly":
+            return f"好，{spoken}后开始提醒你，之后每周。[{aid}]"
+        return f"好，{spoken}后提醒你。[{aid}]"
+
+    def cancel_reminder(self, *, alarm_id: str = "", query: str = "") -> str:
+        if not self.enabled or not self.alarms or not self.store:
+            return "记忆功能未启用。"
+        q = (query or "").strip()
+        aid = (alarm_id or "").strip()
+        if q in ("全部", "所有", "全部提醒", "所有提醒"):
+            n = self.alarms.cancel_all_pending()
+            return f"已取消全部提醒（{n} 条）。" if n else "没有待触发的提醒。"
+
+        targets: list[dict] = []
+        if aid:
+            row = self.alarms.get(aid)
+            if row and row.get("status") == "pending":
+                targets = [row]
+            else:
+                return f"没找到提醒 {aid}。"
+        elif q:
+            targets = self.alarms.find_pending(q)
+        else:
+            return "请说明要取消哪条提醒，或说「全部」。"
+
+        if not targets:
+            return "没找到匹配的提醒。"
+        if len(targets) > 1:
+            lines = []
+            for a in targets[:10]:
+                ts = time.strftime("%Y-%m-%d %H:%M", time.localtime(float(a["fire_at"])))
+                lines.append(f"[{a['id']}] {ts} {a.get('label') or ''}")
+            return "匹配到多条提醒，请说得更具体或用编号：\n" + "\n".join(lines)
+
+        a = targets[0]
+        self.alarms.cancel(a["id"])
+        mid = (a.get("memory_id") or "").strip()
+        if mid and self.eraser:
+            self.eraser.erase(memory_id=mid, confirmed=True)
+        label = (a.get("label") or "").strip() or "提醒"
+        return f"已取消「{label}」。"
+
+    def update_reminder(
+        self,
+        *,
+        alarm_id: str = "",
+        query: str = "",
+        minutes: float | None = None,
+        at: str | None = None,
+        label: str | None = None,
+        repeat: str | None = None,
+    ) -> str:
+        if not self.enabled or not self.alarms or not self.store:
+            return "记忆功能未启用。"
+        aid = (alarm_id or "").strip()
+        q = (query or "").strip()
+        targets: list[dict] = []
+        if aid:
+            row = self.alarms.get(aid)
+            if row and row.get("status") == "pending":
+                targets = [row]
+            else:
+                return f"没找到提醒 {aid}。"
+        elif q:
+            targets = self.alarms.find_pending(q)
+        else:
+            return "请说明要修改哪条提醒。"
+
+        if not targets:
+            return "没找到匹配的提醒。"
+        if len(targets) > 1:
+            lines = []
+            for a in targets[:10]:
+                ts = time.strftime("%Y-%m-%d %H:%M", time.localtime(float(a["fire_at"])))
+                lines.append(f"[{a['id']}] {ts} {a.get('label') or ''}")
+            return "匹配到多条提醒，请说得更具体或用编号：\n" + "\n".join(lines)
+
+        a = targets[0]
+        fire_at: float | None = None
+        at_s = (at or "").strip()
+        if at_s:
+            try:
+                fire_at = parse_at(at_s)
+            except ValueError as e:
+                return f"时间无效：{e}"
+        elif minutes is not None and float(minutes) > 0:
+            fire_at = time.time() + float(minutes) * 60.0
+
+        try:
+            updated = self.alarms.reschedule(
+                a["id"],
+                fire_at=fire_at,
+                repeat_rule=repeat,
+                label=label,
+            )
+        except ValueError as e:
+            return str(e)
+        if not updated:
+            return "修改失败。"
+
+        mid = (updated.get("memory_id") or "").strip()
+        new_label = str(updated.get("label") or "")
+        if mid and (label is not None or at_s or minutes is not None):
+            ts = time.strftime("%Y-%m-%d %H:%M", time.localtime(float(updated["fire_at"])))
+            text = new_label or f"{ts} 提醒"
+            try:
+                self.store.update_fields(mid, content=text, summary=text)
+            except Exception:  # noqa: BLE001
+                pass
+
+        ts = time.strftime("%Y-%m-%d %H:%M", time.localtime(float(updated["fire_at"])))
+        rep = updated.get("repeat_rule") or "once"
+        return f"已改成 {ts}「{new_label or '提醒'}」（{rep}）。"
 
     # ------------------------------------------------------------------ worker
 
@@ -357,12 +531,25 @@ class MemoryService:
             # 擦除结果不自动改 reply（语音回合已结束）；仅落库
             return
         if draft.should_store:
-            self.writer.write(draft, session_id=self.session_id, source="observe")
-            # 若带 schedule 且有相对时间，额外建闹钟
+            scheduled = False
             if draft.schedule and self.alarms:
-                mins = parse_relative_minutes(str(draft.schedule.get("hint") or user_text))
-                if mins and mins > 0:
-                    self.alarms.schedule_in(mins, label=draft.summary or draft.content)
+                sch = draft.schedule
+                label = draft.summary or draft.content
+                repeat = str(sch.get("repeat") or "once")
+                at_raw = sch.get("at")
+                try:
+                    if at_raw:
+                        out = self.schedule_reminder(at=str(at_raw), label=label, repeat=repeat)
+                        scheduled = bool(out) and not out.startswith("时间无效") and "必须在未来" not in out
+                    else:
+                        mins = parse_relative_minutes(str(sch.get("hint") or user_text))
+                        if mins and mins > 0:
+                            out = self.schedule_reminder(minutes=mins, label=label, repeat=repeat)
+                            scheduled = bool(out)
+                except Exception as e:  # noqa: BLE001
+                    _warn(f"observe 提醒失败：{e}")
+            if not scheduled:
+                self.writer.write(draft, session_id=self.session_id, source="observe")
         if self.digest:
             self.digest.maybe_episode(self.session_id)
 

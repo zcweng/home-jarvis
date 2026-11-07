@@ -11,6 +11,8 @@
 from __future__ import annotations
 
 import sys
+import tempfile
+import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -18,6 +20,7 @@ sys.path.insert(0, str(ROOT))
 
 from jarvis.config import Settings  # noqa: E402
 from jarvis.ha import HAClient  # noqa: E402
+from jarvis.memory import MemoryService, MemorySettings  # noqa: E402
 from jarvis.tools import Tools  # noqa: E402
 
 results: list[tuple[str, bool, str]] = []
@@ -94,6 +97,32 @@ def main() -> int:
 
     r = tools.timer(0.02, "自检")
     check("定时器", "提醒" in r, r)
+
+    r = tools.timer(action="list")
+    check("无记忆时 list 提醒", "MEMORY_ENABLED" in r or "记忆" in r, r)
+    r = tools.timer(at="2099-01-01 12:00", label="远方")
+    check("无记忆时绝对时间", "MEMORY_ENABLED" in r or "记忆" in r, r)
+
+    with tempfile.TemporaryDirectory() as td:
+        ms = MemorySettings(
+            enabled=True,
+            db_path=str(Path(td) / "m.db"),
+            model_dir=str(Path(td) / "no-model"),
+        )
+        svc = MemoryService(ms, root=Path(td))
+        tmem = Tools(ha, settings=st, memory=svc)
+        at_s = time.strftime("%Y-%m-%d %H:%M", time.localtime(time.time() + 3700))
+        r = tmem.timer(action="set", at=at_s, label="吃药", repeat="daily")
+        check("记忆-绝对+每天", "提醒" in r and ("每天" in r or "daily" in r.lower()), r)
+        r = tmem.timer(action="list")
+        check("记忆-list", "吃药" in r, r)
+        r = tmem.timer(action="update", query="吃药", minutes=90, label="吃药改")
+        check("记忆-update", "已改成" in r, r)
+        r = tmem.timer(action="cancel", query="吃药改")
+        check("记忆-cancel", "已取消" in r, r)
+        r = tmem.timer(action="list")
+        check("记忆-cancel后list", "没有" in r, r)
+        svc.close()
 
     # 6. 离线设备必须诚实拒控（墙上开关关着的灯就是这个状态）
     offline = [

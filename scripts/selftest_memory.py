@@ -15,7 +15,11 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from jarvis.memory.alarms import AlarmScheduler  # noqa: E402
+from jarvis.memory.alarms import (  # noqa: E402
+    AlarmScheduler,
+    normalize_fire_at,
+    parse_at,
+)
 from jarvis.memory.classifier import classify, rule_classify  # noqa: E402
 from jarvis.memory.decay import (  # noqa: E402
     apply_recall_boost,
@@ -232,6 +236,79 @@ def test_alarms_persist() -> None:
     ok("闹钟持久化与补报")
 
 
+def test_alarms_absolute_repeat_crud_purge() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        db = Path(td) / "m.db"
+        store = MemoryStore(db)
+        sch = AlarmScheduler(store, retention_days=7, tick=0.5)
+        # 不 start 调度线程，纯 API
+        past = time.time() - 3600
+        rolled = normalize_fire_at(past, "daily", now=time.time())
+        if rolled <= time.time():
+            fail("daily 滚次", f"仍过期 {rolled}")
+        at_s = time.strftime("%Y-%m-%d %H:%M", time.localtime(time.time() + 3600))
+        ts = parse_at(at_s)
+        aid = sch.schedule_at(ts, label="开会", repeat_rule="once")
+        hits = sch.find_pending("开会")
+        if len(hits) != 1 or hits[0]["id"] != aid:
+            fail("find_pending", str(hits))
+        nxt = time.time() + 7200
+        sch.reschedule(aid, fire_at=nxt, label="开会改期")
+        got = sch.get(aid)
+        if not got or abs(float(got["fire_at"]) - nxt) > 1 or got["label"] != "开会改期":
+            fail("reschedule", str(got))
+        sch.cancel(aid)
+        got2 = sch.get(aid)
+        if not got2 or got2["status"] != "cancelled" or not got2.get("fired_at"):
+            fail("cancel 写关闭时间", str(got2))
+
+        # 终端态：超 7 天应 purge；未满保留
+        old_id = store.insert_alarm(fire_at=time.time() - 10, label="旧", repeat_rule="once")
+        store.update_alarm(old_id, status="fired", fired_at=time.time() - 8 * 86400)
+        fresh_id = store.insert_alarm(fire_at=time.time() - 5, label="新", repeat_rule="once")
+        store.update_alarm(fresh_id, status="fired", fired_at=time.time() - 3600)
+        n = sch.purge_old()
+        if store.get_alarm(old_id) is not None:
+            fail("purge 超期", "旧记录仍在")
+        if store.get_alarm(fresh_id) is None:
+            fail("purge 保留", "新记录被误删")
+        if n < 1:
+            fail("purge 计数", f"n={n}")
+
+        # MemoryService CRUD
+        ms = MemorySettings(
+            enabled=True,
+            db_path=str(Path(td) / "svc.db"),
+            model_dir=str(Path(td) / "no-model"),
+            alarm_retention_days=7,
+        )
+        svc = MemoryService(ms, root=Path(td))
+        out = svc.schedule_reminder(minutes=30, label="吃药")
+        if "提醒" not in out:
+            fail("schedule_reminder", out)
+        listed = svc.list_reminders()
+        if "吃药" not in listed:
+            fail("list_reminders", listed)
+        cancel = svc.cancel_reminder(query="吃药")
+        if "已取消" not in cancel:
+            fail("cancel_reminder", cancel)
+        if "没有待触发" not in svc.list_reminders() and "没有" not in svc.list_reminders():
+            # 允许「没有待触发的提醒。」
+            if svc.alarms and svc.alarms.list_pending():
+                fail("cancel 后仍 pending", svc.list_reminders())
+        at_future = time.strftime("%Y-%m-%d %H:%M", time.localtime(time.time() + 86400))
+        out2 = svc.schedule_reminder(at=at_future, label="明日事", repeat="daily")
+        if "每天" not in out2 and "daily" not in out2.lower():
+            if "提醒" not in out2:
+                fail("daily schedule", out2)
+        upd = svc.update_reminder(query="明日事", minutes=60)
+        if "已改成" not in upd:
+            fail("update_reminder", upd)
+        svc.close()
+        store.close()
+    ok("绝对时间/重复/CRUD/7天清理")
+
+
 def test_service_facade() -> None:
     with tempfile.TemporaryDirectory() as td:
         ms = MemorySettings(
@@ -302,6 +379,7 @@ def main() -> int:
     test_retrieve_order_and_budget()
     test_digest_compress()
     test_alarms_persist()
+    test_alarms_absolute_repeat_crud_purge()
     test_service_facade()
     test_recall_latency()
     print("全部通过")

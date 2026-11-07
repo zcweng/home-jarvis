@@ -302,22 +302,74 @@ class Tools:
         self.ha.call_service("scene", "turn_on", {"entity_id": hits[0]["entity_id"]})
         return f"已执行场景：{hits[0].get('attributes', {}).get('friendly_name', name)}。"
 
-    def timer(self, minutes: float, label: str = "") -> str:
-        minutes = float(minutes or 0)
-        if minutes <= 0 or minutes > 600:
-            return "定时的时长必须大于 0 分钟、不超过 600 分钟。"
-        # 记忆开启时走持久化闹钟（重启可恢复）
+    def timer(
+        self,
+        minutes: float | None = None,
+        label: str = "",
+        action: str = "set",
+        at: str = "",
+        repeat: str | None = None,
+        alarm_id: str = "",
+        query: str = "",
+    ) -> str:
+        action = (action or "set").strip().lower()
         mem = self.memory
-        if mem is not None and getattr(mem, "enabled", False):
-            out = mem.schedule_timer(minutes, label=label or "")
-            if out:
-                return out
-        secs = minutes * 60
-        # 小于一分钟说"秒"更像人话（"0.0167 分钟"没人这么讲）
-        if minutes < 1:
+        mem_on = mem is not None and getattr(mem, "enabled", False)
+
+        if action == "list":
+            if not mem_on:
+                return "查提醒需要开启记忆（MEMORY_ENABLED）。"
+            return mem.list_reminders()
+        if action == "cancel":
+            if not mem_on:
+                return "取消提醒需要开启记忆（MEMORY_ENABLED）。"
+            return mem.cancel_reminder(alarm_id=alarm_id or "", query=query or "")
+        if action == "update":
+            if not mem_on:
+                return "修改提醒需要开启记忆（MEMORY_ENABLED）。"
+            rep = (repeat or "").strip().lower() or None
+            return mem.update_reminder(
+                alarm_id=alarm_id or "",
+                query=query or "",
+                minutes=float(minutes) if minutes is not None else None,
+                at=at or None,
+                label=label if label != "" else None,
+                repeat=rep,
+            )
+        if action != "set":
+            return f"不支持的 timer action：{action}。"
+
+        at_s = (at or "").strip()
+        repeat_s = (repeat or "once").strip().lower() or "once"
+        needs_memory = bool(at_s) or repeat_s != "once"
+
+        if needs_memory and not mem_on:
+            return "绝对时间或重复提醒需要开启记忆（MEMORY_ENABLED）。"
+
+        if mem_on:
+            if minutes is None and not at_s:
+                return "请提供 minutes 或 at。"
+            if minutes is not None and float(minutes) > 0 and float(minutes) > 10080:
+                return "相对提醒最长 7 天（10080 分钟）。"
+            out = mem.schedule_reminder(
+                minutes=float(minutes) if minutes is not None and not at_s else None,
+                at=at_s or None,
+                label=label or "",
+                repeat=repeat_s,
+            )
+            return out or "设置提醒失败。"
+
+        # 记忆关闭：仅相对 once，走内存 Timer
+        if minutes is None or float(minutes) <= 0:
+            return "请提供 minutes（大于 0）。"
+        minutes_f = float(minutes)
+        if minutes_f > 10080:
+            return "相对提醒最长 7 天（10080 分钟）。"
+        secs = minutes_f * 60
+        if minutes_f < 1:
             spoken = f"{round(secs):g} 秒"
         else:
-            spoken = f"{minutes:g} 分钟"
+            spoken = f"{minutes_f:g} 分钟"
         text = f"{spoken}到了" + (f"，{label}" if label else "") + "。"
 
         def _fire() -> None:
@@ -551,14 +603,45 @@ class Tools:
                 "type": "function",
                 "function": {
                     "name": "timer",
-                    "description": "设置定时提醒。",
+                    "description": (
+                        "设置/取消/修改/列出提醒。绝对时间用 at（本地 YYYY-MM-DD HH:MM），"
+                        "不确定今天日期或星期时先调 get_time。取消全部传 query=全部。"
+                    ),
                     "parameters": {
                         "type": "object",
                         "properties": {
-                            "minutes": {"type": "number", "description": "多少分钟后提醒"},
-                            "label": {"type": "string", "description": "提醒内容，例如「关火」「吃药」"},
+                            "action": {
+                                "type": "string",
+                                "enum": ["set", "cancel", "update", "list"],
+                                "description": "set 默认；cancel/update/list 需记忆开启",
+                            },
+                            "minutes": {
+                                "type": "number",
+                                "description": "多少分钟后提醒（相对；与 at 二选一，都有以 at 为准）",
+                            },
+                            "at": {
+                                "type": "string",
+                                "description": "绝对本地时间，如 2026-11-08 15:30",
+                            },
+                            "repeat": {
+                                "type": "string",
+                                "enum": ["once", "daily", "weekly"],
+                                "description": "重复规则，默认 once",
+                            },
+                            "label": {
+                                "type": "string",
+                                "description": "提醒内容，例如「关火」「吃药」",
+                            },
+                            "alarm_id": {
+                                "type": "string",
+                                "description": "cancel/update 时精确指定闹钟 id",
+                            },
+                            "query": {
+                                "type": "string",
+                                "description": "cancel/update 按文案匹配；取消全部用「全部」",
+                            },
                         },
-                        "required": ["minutes"],
+                        "required": [],
                     },
                 },
             },

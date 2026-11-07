@@ -593,7 +593,25 @@ class MemoryStore:
             return cur.rowcount
 
     def cancel_alarm(self, alarm_id: str) -> None:
-        self.update_alarm(alarm_id, status="cancelled")
+        # fired_at 兼作关闭时间，供 7 天保留期计算（避免回落到 created_at）
+        self.update_alarm(alarm_id, status="cancelled", fired_at=time.time())
+
+    def get_alarm(self, alarm_id: str) -> dict[str, Any] | None:
+        with self._lock:
+            row = self._conn.execute("SELECT * FROM alarms WHERE id=?", (alarm_id,)).fetchone()
+        return dict(row) if row else None
+
+    def purge_terminal_alarms(self, cutoff: float) -> int:
+        """物理删除已结束且结束时刻早于 cutoff 的闹钟行。"""
+        with self._lock:
+            cur = self._conn.execute(
+                """DELETE FROM alarms
+                   WHERE status IN ('fired','missed','cancelled')
+                     AND COALESCE(fired_at, missed_at, created_at) < ?""",
+                (float(cutoff),),
+            )
+            self._conn.commit()
+            return int(cur.rowcount or 0)
 
     # ------------------------------------------------------------------ tombstones / events
 

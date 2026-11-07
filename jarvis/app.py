@@ -236,6 +236,7 @@ class Jarvis:
             episode_every=self.st.memory_episode_every,
             compress_at_messages=self.st.memory_compress_at_messages,
             missed_grace=self.st.memory_missed_grace,
+            alarm_retention_days=self.st.memory_alarm_retention_days,
             llm_model=self.st.memory_llm_model,
         )
         svc = MemoryService(

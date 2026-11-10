@@ -91,6 +91,31 @@ def main() -> int:
     check("窗口到期后上锁", not expired, "release 后 1.3s 已过期")
     check("剩余窗口可读", g3.remaining() == 0.0, f"remaining={g3.remaining():.2f}s")
 
+    # ⑤b 说话跨过窗口边界：开口后 hold，到期也不休眠；切句后交给处理
+    from jarvis.app import tick_followup_speech
+
+    class _SegStub:
+        def __init__(self, speaking: bool = False) -> None:
+            self.speech_detected = speaking
+
+    g5 = WakeGate(follow_up_seconds=0.15)
+    g5.release()  # 模拟播报刚结束，开始 0.15s 窗口
+    held_flag = [False]
+    # 窗口内开口 → 挂起
+    tick_followup_speech(g5, _SegStub(True), [], held_flag)  # type: ignore[arg-type]
+    check("开口即挂起倒计时", held_flag[0] and g5.awake)
+    time.sleep(0.25)  # 超过原窗口
+    check("说话跨越到期点仍醒着", g5.awake, f"remaining={g5.remaining():.2f}")
+    # 同一次 tick 切出句子：把 hold 交给后续 _take，不在此处 release
+    tick_followup_speech(g5, _SegStub(False), [object()], held_flag)  # type: ignore[arg-type]
+    check("切句后仍 hold 待处理", (not held_flag[0]) and g5.awake)
+    g5.release()  # 模拟 _take finally
+    # 人声停了但还没切句：应 release 重新开窗，而不是一直 hold
+    held_flag = [False]
+    tick_followup_speech(g5, _SegStub(True), [], held_flag)  # type: ignore[arg-type]
+    tick_followup_speech(g5, _SegStub(False), [], held_flag)  # type: ignore[arg-type]
+    check("人声停未切句则重开窗", (not held_flag[0]) and g5.awake and g5.remaining() > 0.1)
+
     # ⑥ 收线指令：先播报"好，有事叫我。"，播完再关窗口
     from jarvis.app import handle_sleep
     from jarvis.wake import DEFAULT_SLEEP_WORDS, is_sleep_request

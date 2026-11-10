@@ -59,4 +59,6 @@ backup/s12-*/
 # （Makefile 目标已 strip，产物 123K，但仍不应提交）
 tools/s12audio/build/
 tools/s12led/build/
+tools/s12cap/build/
+tools/beamtest/build/
 tools/common/test_common

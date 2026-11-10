@@ -5,6 +5,8 @@
 晾衣架:
   entity: cover.hyd_cn_333346645_znlyj1_s_2_airer
   type: cover
+  # 米家晾衣架实测：上升走 open_cover，下降走 close_cover（与「closed=到顶」字面相反）
+  cover_up: open
   aliases: [晾衣架 晾衣架]
 
 空调:

@@ -13,14 +13,20 @@
     python -m jarvis.app                     常开 VAD（安静环境可用，会跟电视抢话）
 
 打断（--barge-in）默认关闭：没有 AEC 时喇叭串进麦克风会自己打断自己。
+
+第四种（旁路）输入：一句话里好几件事时走 `jarvis/tasks/`（多任务编排）——
+主对话只回一句「好，三件事，我分开做。」就返回，任务在后台按 DAG 并发跑，
+结果按完成先后**串行**播报；播报期间本循环丢弃麦克风输入（那是自己的回声）。
 """
 
 from __future__ import annotations
 
 import argparse
+import re
 import sys
 import threading
 import time
+from collections import deque
 from dataclasses import replace
 from pathlib import Path
 from typing import Any, Callable
@@ -39,11 +45,19 @@ from .endpoint import (
     parse_endpoint,
 )
 from .ha import HAClient
-from .intent import looks_like_command, looks_like_time, looks_like_weather, looks_like_web_search
+from .intent import (
+    looks_like_command,
+    looks_like_multi_task,
+    looks_like_time,
+    looks_like_weather,
+    looks_like_web_search,
+)
+from .llm import no_thinking_body
 from .agent_runtime import JarvisAgent
 from .memory import MemoryService, MemorySettings, null_service
 from .output import SpeechRouter
 from .session import Session
+from .tasks import TaskService, TaskSettings
 from .tools import Tools
 from .vad import Segmenter
 from .kws import DEFAULT_MODEL as KWS_DEFAULT_MODEL
@@ -127,6 +141,25 @@ def handle_sleep(cmd: str, gate, words: tuple[str, ...], speak) -> bool:
     return True
 
 
+def tick_followup_speech(
+    gate: WakeGate, seg: Segmenter, utts: list, speech_held: list[bool]
+) -> None:
+    """FOLLOW_UP 内正在说话则挂起倒计时；说完且尚未进入处理后重新计时。
+
+    否则长句跨过 8 秒节点时，VAD 切完句 `gate.awake` 已过期，整句被丢掉。
+    `speech_held` 用单元素 list 以便在循环里原地修改。
+    """
+    if speech_held[0]:
+        if utts or not seg.speech_detected:
+            if not utts:
+                # 人声停了、句段还没切出（或短促噪声）：从现在重新开窗
+                gate.release()
+            speech_held[0] = False
+    elif gate.awake and seg.speech_detected:
+        gate.hold()
+        speech_held[0] = True
+
+
 def _is_endpoint(source: str) -> bool:
     return (source or "").strip().lower() in {"speaker_endpoint", "endpoint", "s12"}
 
@@ -142,6 +175,12 @@ class Jarvis:
         self._early_acked = False
         self.interrupted = False
         self._asleep_notice_at = 0.0
+        # 后台任务播报中：麦克风这段时间收到的是自己的声音，不能喂 VAD
+        self._external_speech = False
+        self._ext_speech_dirty = False
+        self._task_summaries: deque[str] = deque(maxlen=20)
+        # 主回答与任务播报共用一把锁：两边都"等空闲"时仍可能同时开口，必须串起来
+        self._speak_lock = threading.Lock()
         self._mic_factory, self._speaker, router_st, audio_label = self._build_audio()
         self.led = self._build_led()
         self.volume = self._build_volume()
@@ -178,6 +217,8 @@ class Jarvis:
             # 记忆分类/摘要复用同一网关（可选 MEMORY_LLM_MODEL）
             if self.memory.enabled:
                 self.memory._llm = self._make_memory_llm()
+        self.tasks = self._build_tasks(use_fake_llm=use_fake_llm)
+        self.tools.bind_tasks(self.tasks)
         self._here_phrase = "我在"
         self._awake_announced_at = 0.0
         if speak and self._ack_phrases:
@@ -252,32 +293,147 @@ class Jarvis:
             )
         return svc
 
-    def _make_memory_llm(self):
-        """给分类器/摘要用的同步 LLM 闭包；失败返回空串。"""
+    def _make_llm_fn(
+        self,
+        model: str,
+        *,
+        timeout: float = 6.0,
+        max_tokens: int = 400,
+        label: str = "辅助",
+    ):
+        """建一个「只出文本」的同步 LLM 闭包（记忆分类、任务规划用）。
+
+        故意不复用 JarvisAgent：那条路带工具/会话/事件循环，规划只需要一次 JSON，
+        多一层工具循环反而更慢更容易跑偏。
+        """
         st = self.st
-        model = (st.memory_llm_model or st.llm_model).strip()
+        model = (model or "").strip()
         api_key = (st.llm_api_key or st.deepseek_key or "").strip()
         base = st.llm_base_url.rstrip("/")
         if not api_key or not model:
             return None
 
+        extra_body = self._no_thinking_body()
+
         def _call(prompt: str) -> str:
             try:
                 from openai import OpenAI
 
-                client = OpenAI(api_key=api_key, base_url=base, timeout=6.0)
-                resp = client.chat.completions.create(
-                    model=model,
-                    messages=[{"role": "user", "content": prompt}],
-                    temperature=0.0,
-                    max_tokens=400,
-                )
+                client = OpenAI(api_key=api_key, base_url=base, timeout=timeout)
+                kwargs: dict[str, Any] = {
+                    "model": model,
+                    "messages": [{"role": "user", "content": prompt}],
+                    "temperature": 0.0,
+                    "max_tokens": max_tokens,
+                }
+                if extra_body:
+                    kwargs["extra_body"] = extra_body
+                resp = client.chat.completions.create(**kwargs)
                 return (resp.choices[0].message.content or "").strip()
             except Exception as e:  # noqa: BLE001
-                print(f"  ⚠️  memory LLM：{e}", file=sys.stderr)
+                print(f"  ⚠️  {label} LLM：{e}", file=sys.stderr)
                 return ""
 
         return _call
+
+    def _no_thinking_body(self) -> dict[str, Any] | None:
+        return no_thinking_body(self.st)
+
+    def _make_memory_llm(self):
+        """给分类器/摘要用的同步 LLM 闭包；失败返回空串。"""
+        return self._make_llm_fn(
+            self.st.memory_llm_model or self.st.llm_model,
+            timeout=6.0,
+            max_tokens=400,
+            label="memory",
+        )
+
+    # ------------------------------------------------------------------ 任务编排
+
+    def _build_tasks(self, use_fake_llm: bool) -> TaskService | None:
+        """多任务编排：一句话拆 DAG、后台并发执行、按完成顺序播报。"""
+        if not getattr(self.st, "task_enabled", False):
+            return None
+        ts = TaskSettings.from_settings(self.st)
+        llm = None
+        if not use_fake_llm:
+            llm = self._make_llm_fn(
+                self.st.task_plan_model or self.st.llm_model,
+                timeout=self.st.task_plan_timeout,
+                max_tokens=700,
+                label="任务规划",
+            )
+        from .config import ROOT
+
+        svc = TaskService(
+            ts,
+            self.tools,
+            llm,
+            speak=self._speak_task_result,
+            is_idle=lambda: not self.tts.speaking,
+            on_busy=self._set_external_speech,
+            on_summary=self._queue_task_summary,
+            root=ROOT,
+        )
+        if not svc.enabled():
+            print(f"⚠️  多任务编排未启用：{svc.why_disabled()}", file=sys.stderr)
+            return svc
+        ann = "开" if ts.announce else "静音"
+        print(
+            f"任务编排：开 · 并发 {ts.max_concurrency} · 一句话最多 {ts.max_tasks} 件 · "
+            f"子任务最多 {ts.max_depth} 层 · 播报 {ann}",
+            file=sys.stderr,
+        )
+        return svc
+
+    def _speak_task_result(self, text: str) -> None:
+        """任务结果播报（播报线程串行调用；与主回答共用一把锁）。"""
+        with self._speak_lock:
+            self._led("speak")
+            try:
+                self.tts.speak(text)
+            finally:
+                self._led("listen")
+
+    def _set_external_speech(self, busy: bool) -> None:
+        """后台播报开关：开会话态，主循环据此丢弃麦克风回声。"""
+        self._external_speech = bool(busy)
+        if busy:
+            self._ext_speech_dirty = True
+
+    def _queue_task_summary(self, run) -> None:  # noqa: ANN001
+        """任务组跑完：只留一句总结进历史，明细在 data/tasks/*.jsonl。"""
+        summary = (run.summary or "").strip()
+        if summary:
+            self._task_summaries.append(summary)
+
+    def _flush_task_summaries(self) -> None:
+        """把后台任务总结并进会话历史（只在主线程、开新一轮时做）。"""
+        while self._task_summaries:
+            try:
+                summary = self._task_summaries.popleft()
+            except IndexError:  # pragma: no cover - 竞态兜底
+                break
+            self.session.add_assistant(summary)
+            print(f"  📝 历史追加任务总结：{summary}")
+
+    def _external_speech_active(self, mic, seg) -> bool:  # noqa: ANN001
+        """后台任务正在播报 → 返回 True，调用方应丢掉这块音频。
+
+        播完再一次性 drain + reset VAD，避免把播报尾巴切成半句话说给模型。
+        """
+        if self._external_speech:
+            self._ext_speech_dirty = True
+            return True
+        if self._ext_speech_dirty:
+            self._ext_speech_dirty = False
+            try:
+                mic.drain(0.15 if not _is_endpoint(self.st.audio_source) else 0.4)
+            except TypeError:
+                mic.drain()
+            if hasattr(seg, "reset"):
+                seg.reset()
+        return False
 
     def _build_led(self):
         """端点模式且 LED_ENABLED 时接 S12 灯环；否则空操作。"""
@@ -444,6 +600,8 @@ class Jarvis:
         """一段音频 → 一句回答（同时朗读）。返回回答文本。"""
         self.interrupted = False
         self._asleep_notice_at = 0.0
+        # 注意：这里不能重置 self._task_summaries / _external_speech —— 
+        # 后台任务线程正在往里面写，每句都清空等于把还没并进历史的任务总结丢掉。
         if pcm.size < int(0.2 * TARGET_RATE):
             return ""
 
@@ -452,12 +610,31 @@ class Jarvis:
             print("  · 没听清，跳过")
             return ""
 
+        text = self._normalize_asr(text)
         print(f"  👤 {text}   ({asr_ms:.0f}ms ASR)")
         return self.handle_text(text, mic=mic)
+
+    @staticmethod
+    def _normalize_asr(text: str) -> str:
+        """纠几处会改变家电意图的 ASR 近音（只在相关设备语境下替换）。"""
+        t = (text or "").strip()
+        if re.search(r"晾衣", t):
+            t = t.replace("晾衣件儿", "晾衣架").replace("晾衣件", "晾衣架")
+            t = t.replace("上身", "上升").replace("下身", "下降")
+        return t
 
     def handle_text(self, text: str, mic: Mic | None = None) -> str:
         """已经拿到文本时直接进思考+说话（唤醒门控走这条路，避免二次 ASR）。"""
         self._early_acked = False
+        text = self._normalize_asr(text)
+        # 上一批后台任务的结果：只并一句总结进历史，明细不占上下文
+        self._flush_task_summaries()
+        # 一句话里好几件事 → 拆成后台任务，立刻回一句确认就返回
+        ack = self._try_async_tasks(text)
+        if ack is not None:
+            self._speak_reply(ack, mic)
+            self._led("listen")
+            return ack
         self._led("think")
         hint = self.llm.call_hint() if hasattr(self.llm, "call_hint") else ""
         print(f"  🔗 LLM 调用：user=「{text}」 {hint}", flush=True)
@@ -511,7 +688,40 @@ class Jarvis:
         calls = "、".join(c[0] for c in res.tool_results) or "无"
         print(f"  🤖 {reply}   ({res.latency_ms:.0f}ms LLM · {res.rounds} 轮 · 工具 {calls})")
 
-        if self.speak_enabled:
+        self._speak_reply(reply, mic)
+        self._led("listen")
+        return reply
+
+    def _try_async_tasks(self, text: str) -> str | None:
+        """多意图 → 拆任务、后台执行。返回确认语；不走编排返回 None。"""
+        svc = getattr(self, "tasks", None)
+        if svc is None or not svc.can_plan():
+            return None
+        if not looks_like_multi_task(text):
+            return None
+        self._led("think")
+        print(f"  🧩 多意图，交给任务编排：「{text}」", flush=True)
+        try:
+            sub = svc.submit(text, context=self.session.last_result_hint())
+        except Exception as e:  # noqa: BLE001 — 编排层任何问题都退回普通单轮
+            print(f"  ⚠️  任务编排异常，回退普通单轮：{e}", file=sys.stderr)
+            return None
+        if not sub.accepted:
+            print(f"  ↩️  没走编排（{sub.reason}），回退普通单轮", file=sys.stderr)
+            return None
+        self.session.add_user(text)
+        self.session.add_assistant(sub.ack)
+        print(
+            f"  🤖 {sub.ack}（{sub.count} 件 · 规划 {sub.plan_ms:.0f}ms · 后台执行）",
+            flush=True,
+        )
+        return sub.ack
+
+    def _speak_reply(self, reply: str, mic: Mic | None = None) -> None:
+        """播报一句回答（含打断与回声排空）。"""
+        if not self.speak_enabled:
+            return
+        with self._speak_lock:  # 任务播报正在说就先等它说完，别抢同一段时间
             self.tts.wait_idle()  # 先出声的"好的"还没播完就先等等，别两句叠在一起
             t1 = time.perf_counter()
             self._led("speak")
@@ -520,12 +730,10 @@ class Jarvis:
             else:
                 self.tts.speak(reply)
             print(f"  🔊 播报 {(time.perf_counter() - t1) * 1000:.0f}ms")
-            # 播报期间麦克风一直在往队列里塞自己的声音，不排空的话
-            # 下一轮会把喇叭回声当成用户说话（VAD 说是"有声"，其实是自己）
-            if mic is not None and not self.interrupted:
-                mic.drain()
-        self._led("listen")
-        return reply
+        # 播报期间麦克风一直在往队列里塞自己的声音，不排空的话
+        # 下一轮会把喇叭回声当成用户说话（VAD 说是"有声"，其实是自己）
+        if mic is not None and not self.interrupted:
+            mic.drain()
 
     def _speak_network_glitch(self, mic: Mic | None) -> str:
         """LLM 超时/断网：播一句提示，不把主循环打崩。"""
@@ -666,6 +874,8 @@ class Jarvis:
                         return
                     continue
                 chunk = mic.read(timeout=1.0)
+                if self._external_speech_active(mic, seg):
+                    continue  # 后台任务在播报，这段是回声
                 if chunk is None:
                     continue
                 for utt in seg.accept(chunk):
@@ -797,15 +1007,19 @@ class Jarvis:
         with self._mic_factory() as mic:
             print("（Ctrl+C 退出）")
             was_awake = False
+            speech_held = [False]  # FOLLOW_UP 内开口则挂起 8s 倒计时
             try:
                 while True:
                     chunk = mic.read(timeout=0.5)
                     if self.mic_muted:
+                        speech_held[0] = False
                         if gate.awake:
                             gate.sleep()
                         if was_awake:
                             was_awake = False
                         continue
+                    if self._external_speech_active(mic, seg):
+                        continue  # 后台任务在播报，这段是回声
                     if chunk is None:
                         if was_awake and not gate.awake:
                             self._led("idle")
@@ -825,7 +1039,9 @@ class Jarvis:
                             was_awake = False
                     else:
                         was_awake = True
-                    for utt in seg.accept(chunk):
+                    utts = seg.accept(chunk)
+                    tick_followup_speech(gate, seg, utts, speech_held)
+                    for utt in utts:
                         if not gate.awake:
                             self._note_asleep()
                             continue
@@ -888,15 +1104,21 @@ class Jarvis:
                         min_silence=self.st.vad_silence_ms / 1000)
         with self._mic_factory() as mic:
             print("（Ctrl+C 退出）")
+            speech_held = [False]
             while True:
                 chunk = mic.read(timeout=1.0)
+                if self._external_speech_active(mic, seg):
+                    continue  # 后台任务在播报，这段是回声
                 if self.mic_muted:
+                    speech_held[0] = False
                     if gate.awake:
                         gate.sleep()
                     continue
                 if chunk is None:
                     continue
-                for utt in seg.accept(chunk):
+                utts = seg.accept(chunk)
+                tick_followup_speech(gate, seg, utts, speech_held)
+                for utt in utts:
                     if _process(utt, mic) and once:
                         return 1
         return 0
@@ -947,6 +1169,12 @@ def main(argv: list[str] | None = None) -> int:
     except KeyboardInterrupt:
         print("\n再见")
     finally:
+        tasks = getattr(app, "tasks", None)
+        if tasks is not None and hasattr(tasks, "close"):
+            try:
+                tasks.close()
+            except Exception:  # noqa: BLE001
+                pass
         app.tools.cancel_timers()
         mem = getattr(app, "memory", None)
         if mem is not None and hasattr(mem, "close"):

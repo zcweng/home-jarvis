@@ -134,6 +134,18 @@ class Settings:
     announce_max_chars: int = 80       # 单条文本上限，超了按句切分
     # 会话
     follow_up_seconds: float = 8.0
+    # 多任务编排（一句话拆成任务 DAG，后台并发执行、按完成顺序播报）
+    # 依赖可选包 langgraph：uv sync --extra tasks；没装则自动降级成普通单轮
+    task_enabled: bool = True
+    task_max_concurrency: int = 2      # 同时最多跑几个工具任务，超出的排队
+    task_max_tasks: int = 8            # 一句话最多拆几件
+    task_max_depth: int = 2            # 子 agent 嵌套层数；1=不拆子任务
+    task_announce: bool = True         # False=只记账不出声（夜间/自检）
+    task_announce_failures: bool = True
+    task_idle_wait: float = 12.0       # 等主对话说完再播任务结果，避免叠音
+    task_log_dir: str = "data/tasks"   # 每次任务的明细 jsonl（主会话只留总结）
+    task_plan_model: str = ""          # 空=复用 LLM_MODEL
+    task_plan_timeout: float = 8.0     # 规划（一次 JSON 输出）的超时
     # 网页搜索（SearXNG + Crawl4AI / local-web-search）
     web_search_enabled: bool = False
     web_search_count: int = 5
@@ -228,6 +240,16 @@ class Settings:
             announce_entity=_env("ANNOUNCE_ENTITY", cls.announce_entity),
             announce_max_chars=_env_int("ANNOUNCE_MAX_CHARS", cls.announce_max_chars),
             follow_up_seconds=_env_float("FOLLOW_UP_SECONDS", cls.follow_up_seconds),
+            task_enabled=_env("TASK_ENABLED", "true").lower() in ("1", "true", "yes"),
+            task_max_concurrency=_env_int("TASK_MAX_CONCURRENCY", cls.task_max_concurrency),
+            task_max_tasks=_env_int("TASK_MAX_TASKS", cls.task_max_tasks),
+            task_max_depth=_env_int("TASK_MAX_DEPTH", cls.task_max_depth),
+            task_announce=_env("TASK_ANNOUNCE", "true").lower() in ("1", "true", "yes"),
+            task_announce_failures=_env("TASK_ANNOUNCE_FAILURES", "true").lower() in ("1", "true", "yes"),
+            task_idle_wait=_env_float("TASK_IDLE_WAIT", cls.task_idle_wait),
+            task_log_dir=_env("TASK_LOG_DIR", cls.task_log_dir),
+            task_plan_model=_env("TASK_PLAN_MODEL", cls.task_plan_model),
+            task_plan_timeout=_env_float("TASK_PLAN_TIMEOUT", cls.task_plan_timeout),
             web_search_enabled=_env("WEB_SEARCH_ENABLED", "false").lower() in ("1", "true", "yes"),
             web_search_count=_env_int("WEB_SEARCH_COUNT", cls.web_search_count),
             web_search_timeout=_env_float("WEB_SEARCH_TIMEOUT", cls.web_search_timeout),

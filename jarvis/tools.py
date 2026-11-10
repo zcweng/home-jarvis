@@ -34,12 +34,30 @@ class Device:
     type: str
     room: str
     aliases: tuple[str, ...] = ()
+    # cover 的「上升」对应 HA 服务：open=open_cover，close=close_cover。
+    # 米家晾衣架实测要写 open（升=open_cover）；普通窗帘常可省略。
+    cover_up: str = ""
 
     def label(self) -> str:
         # "客厅灯" 已经在名字里带了房间，就别再拼一次成 "客厅·客厅灯"
         if not self.room or self.room in self.name:
             return self.name
         return f"{self.room}{self.name}"
+
+    def is_lift_cover(self) -> bool:
+        """升降类（晾衣架），查询话术用「到顶/在下面」而不是「开着/关着」。"""
+        eid = self.entity_id.lower()
+        return "airer" in eid or "znlyj" in eid or "晾衣架" in self.name
+
+    def cover_up_is_close(self) -> bool:
+        """上升是否走 close_cover。显式 cover_up 优先；米家晾衣架默认 open_cover。"""
+        cu = (self.cover_up or "").strip().lower()
+        if cu in ("close", "closed", "retract"):
+            return True
+        if cu in ("open", "opened", "extend"):
+            return False
+        # 未配置时：晾衣架按实测走 open_cover；其它 cover 按 HA 常见「升≈open」
+        return False
 
 
 class Tools:
@@ -60,9 +78,14 @@ class Tools:
         self._timers: list[threading.Timer] = []
         self.memory = memory  # MemoryService | None；timer / memory 工具委托
         self._tts: Any = None  # SwitchableTTS；set_tts 热切换
+        self._tasks: Any = None  # TaskService；多任务编排的查询/取消入口
 
     def bind_memory(self, memory: Any) -> None:
         self.memory = memory
+
+    def bind_tasks(self, service: Any) -> None:
+        """接上多任务编排（TaskService）；不接就只是不注册 tasks 工具。"""
+        self._tasks = service
 
     def bind_tts(self, tts: Any) -> None:
         self._tts = tts
@@ -88,6 +111,7 @@ class Tools:
                 type=str(item.get("type", "light")),
                 room=str(item.get("room", "")),
                 aliases=tuple(str(a) for a in (item.get("aliases") or [])),
+                cover_up=str(item.get("cover_up") or "").strip().lower(),
             )
         return out
 
@@ -115,7 +139,13 @@ class Tools:
         lines = []
         for d in self.devices.values():
             extra = "/".join(d.aliases) if d.aliases else ""
-            lines.append(f"- {d.name}（{d.room or '未分房间'}，{d.type}）{(' 又叫：' + extra) if extra else ''}")
+            hint = ""
+            if d.type == "cover" or d.entity_id.startswith("cover."):
+                hint = "，升降用 up/down/stop"
+            lines.append(
+                f"- {d.name}（{d.room or '未分房间'}，{d.type}{hint}）"
+                f"{(' 又叫：' + extra) if extra else ''}"
+            )
         return "\n".join(lines)
 
     # ---------------------------------------------------------------- 工具实现
@@ -135,6 +165,9 @@ class Tools:
 
         action = (action or "").strip().lower()
         try:
+            if dev.type == "cover" or dev.entity_id.startswith("cover."):
+                return self._control_cover(dev, action)
+
             if action in ("on", "open", "turn_on", "打开", "开"):
                 if dev.type == "light":
                     self.ha.call_service("light", "turn_on", {"entity_id": dev.entity_id})
@@ -152,6 +185,9 @@ class Tools:
             if action in ("toggle", "切换"):
                 self.ha.call_service("homeassistant", "toggle", {"entity_id": dev.entity_id})
                 return f"已切换{dev.label()}。"
+
+            if action in ("up", "down", "stop", "升", "降", "停", "上升", "下降"):
+                return f"{dev.label()}不支持升降，请用 on / off。"
 
             if action in ("brightness", "set_brightness", "亮度"):
                 pct = max(0, min(100, int(value if value is not None else 100)))
@@ -178,10 +214,53 @@ class Tools:
                 )
                 return f"{dev.label()}已设为 {value}度。"
 
-            return f"不支持的动作：{action}。可用：on / off / toggle / brightness / brightness_delta / color_temp。"
+            return (
+                f"不支持的动作：{action}。"
+                "可用：on / off / toggle / up / down / stop / brightness / brightness_delta / color_temp。"
+            )
 
         except HAError as e:
             return f"操作失败：{e}"
+
+    def _control_cover(self, dev: Device, action: str) -> str:
+        """cover 专用：升降走 cover.*，回报「开始…」避免模型把 HTTP 成功说成已经到位。"""
+        up_close = dev.cover_up_is_close()
+        up_svc = "close_cover" if up_close else "open_cover"
+        down_svc = "open_cover" if up_close else "close_cover"
+        lift = dev.is_lift_cover()
+
+        if action in ("up", "升", "上升", "升起", "收起", "收起来", "上身"):
+            self.ha.call_service("cover", up_svc, {"entity_id": dev.entity_id})
+            return f"{dev.label()}开始上升。"
+
+        if action in ("down", "降", "下降", "降下", "放下", "放下来", "下身"):
+            self.ha.call_service("cover", down_svc, {"entity_id": dev.entity_id})
+            return f"{dev.label()}开始下降。"
+
+        if action in ("stop", "停", "停止"):
+            self.ha.call_service("cover", "stop_cover", {"entity_id": dev.entity_id})
+            return f"{dev.label()}已停下。"
+
+        # 晾衣架口语「关/收」=升，「开/放」=降；窗帘仍是普通开合
+        if action in ("on", "open", "turn_on", "打开", "开"):
+            if lift:
+                self.ha.call_service("cover", down_svc, {"entity_id": dev.entity_id})
+                return f"{dev.label()}开始放下。"
+            self.ha.call_service("cover", "open_cover", {"entity_id": dev.entity_id})
+            return f"已打开{dev.label()}。"
+
+        if action in ("off", "close", "turn_off", "关闭", "关"):
+            if lift:
+                self.ha.call_service("cover", up_svc, {"entity_id": dev.entity_id})
+                return f"{dev.label()}开始上升收起。"
+            self.ha.call_service("cover", "close_cover", {"entity_id": dev.entity_id})
+            return f"已关闭{dev.label()}。"
+
+        if action in ("toggle", "切换"):
+            self.ha.call_service("cover", "toggle", {"entity_id": dev.entity_id})
+            return f"已切换{dev.label()}。"
+
+        return f"不支持的动作：{action}。升降类请用 up / down / stop。"
 
     def query(self, device: str) -> str:
         dev = self.resolve(device)
@@ -203,6 +282,32 @@ class Tools:
             if attrs.get("color_temp_kelvin"):
                 parts.append(f"{attrs['color_temp_kelvin']}K")
             return f"{dev.label()}现在{'，'.join(parts)}。"
+        if dev.type == "cover" or dev.entity_id.startswith("cover."):
+            return self._query_cover(dev, state, attrs)
+        return f"{dev.label()}现在状态：{state}。"
+
+    def _query_cover(self, dev: Device, state: str, attrs: dict) -> str:
+        pos = attrs.get("current_position")
+        # 晾衣架：位置语义固定 closed/0=到顶、open/100=在下面；
+        # 电机方向由 cover_up 单独配置，二者可能相反。
+        if dev.is_lift_cover():
+            if state in ("opening", "closing"):
+                return f"{dev.label()}正在动。"
+            if state == "closed" or pos == 0:
+                return f"{dev.label()}显示已到顶。"
+            if state == "open" or pos == 100:
+                return f"{dev.label()}在下面。"
+            if isinstance(pos, (int, float)):
+                return f"{dev.label()}大约在 {int(pos)}% 高度。"
+            return f"{dev.label()}现在状态：{state}。"
+        if state in ("opening", "closing"):
+            return f"{dev.label()}正在{'打开' if state == 'opening' else '关闭'}。"
+        if state == "open":
+            return f"{dev.label()}开着。"
+        if state == "closed":
+            return f"{dev.label()}关着。"
+        if isinstance(pos, (int, float)):
+            return f"{dev.label()}开到大约 {int(pos)}%。"
         return f"{dev.label()}现在状态：{state}。"
 
     # ---------------------------------------------------------------- 播报
@@ -417,6 +522,20 @@ class Tools:
             except Exception:  # noqa: BLE001
                 pass
 
+    # ---------------------------------------------------------------- 多任务
+
+    def tasks_tool(self, action: str = "query", target: str = "") -> str:
+        """查询/取消后台任务组（语音入口）。"""
+        svc = self._tasks
+        if svc is None:
+            return "多任务编排没启用。"
+        a = (action or "query").strip().lower()
+        if a in ("query", "list", "status", "progress", "查询", "进度"):
+            return str(svc.describe())
+        if a in ("cancel", "abort", "stop", "取消"):
+            return str(svc.cancel(target))
+        return f"不支持的任务动作：{action}。"
+
     # ---------------------------------------------------------------- 内部
 
     def _brightness_pct(self, entity_id: str) -> int:
@@ -538,15 +657,32 @@ class Tools:
                 "type": "function",
                 "function": {
                     "name": "control",
-                    "description": "开关或调节家电。设备用中文名，例如「客厅灯」「卧室灯」。",
+                    "description": (
+                        "开关或调节家电。设备用中文名，例如「客厅灯」「晾衣架」。"
+                        "晾衣架/窗帘升降：上升用 up、下降用 down、中途停用 stop；不要把「上升」说成 on。"
+                    ),
                     "parameters": {
                         "type": "object",
                         "properties": {
                             "device": {"type": "string", "description": "设备中文名"},
                             "action": {
                                 "type": "string",
-                                "enum": ["on", "off", "toggle", "brightness", "brightness_delta", "color_temp", "temperature"],
-                                "description": "动作；brightness_delta 用于「再亮一点/暗一点」这类相对调整",
+                                "enum": [
+                                    "on",
+                                    "off",
+                                    "toggle",
+                                    "up",
+                                    "down",
+                                    "stop",
+                                    "brightness",
+                                    "brightness_delta",
+                                    "color_temp",
+                                    "temperature",
+                                ],
+                                "description": (
+                                    "on/off=开关；up/down/stop=升降类（晾衣架上升/下降/停止）；"
+                                    "brightness_delta=再亮/暗一点"
+                                ),
                             },
                             "value": {
                                 "type": "number",
@@ -721,6 +857,35 @@ class Tools:
                     },
                 }
             )
+        if getattr(self.settings, "task_enabled", False):
+            out.append(
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "tasks",
+                        "description": (
+                            "查询或取消后台的多任务。用户问「刚才那几件事做到哪了」「还有几个任务」"
+                            "「第2件在干嘛」时用 query；说「取消第2件」「全部取消」「剩下的别做了」时用 cancel。"
+                            "不要凭记忆编造任务进度，必须调用本工具。"
+                        ),
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "action": {
+                                    "type": "string",
+                                    "enum": ["query", "cancel"],
+                                    "description": "query=查进度；cancel=取消",
+                                },
+                                "target": {
+                                    "type": "string",
+                                    "description": "cancel 时指定：序号（2）、任务名片段，或「全部」",
+                                },
+                            },
+                            "required": ["action"],
+                        },
+                    },
+                }
+            )
         if self.settings.weather_enabled:
             default_city = (self.settings.weather_default_city or "成都").strip()
             out.append(
@@ -847,6 +1012,7 @@ class Tools:
             "web_fetch": self.web_fetch,
             "weather": self.weather,
             "set_tts": self.set_tts,
+            "tasks": self.tasks_tool,
         }.get(name)
         if fn is None:
             return f"没有这个工具：{name}"
@@ -856,6 +1022,8 @@ class Tools:
             return "天气查询未启用。"
         if name == "memory" and not getattr(self.settings, "memory_enabled", False):
             return "记忆功能未启用。"
+        if name == "tasks" and self._tasks is None:
+            return "多任务编排没启用。"
         try:
             return str(fn(**args))
         except TypeError as e:

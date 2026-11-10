@@ -157,6 +157,48 @@ def main() -> int:
     cat = tools.catalog()
     check("设备清单", len(cat.splitlines()) == len(tools.devices), f"{len(cat.splitlines())} 行")
 
+    # 9. cover 升降语义（假 HA，不碰真机）：晾衣架 up→close_cover，窗帘 up→open_cover
+    class _FakeHA:
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, str, dict]] = []
+
+        def state(self, entity_id: str) -> dict:
+            return {"state": "closed", "attributes": {"current_position": 0}}
+
+        def call_service(self, domain: str, service: str, data: dict) -> list:
+            self.calls.append((domain, service, data))
+            return []
+
+    with tempfile.TemporaryDirectory() as td:
+        alias = Path(td) / "aliases.yaml"
+        alias.write_text(
+            "晾衣架:\n"
+            "  entity: cover.airer_x\n"
+            "  type: cover\n"
+            "  cover_up: open\n"
+            "窗帘:\n"
+            "  entity: cover.curtain_x\n"
+            "  type: cover\n"
+            "  cover_up: close\n",
+            encoding="utf-8",
+        )
+        fake = _FakeHA()
+        ct = Tools(fake, aliases_path=alias, settings=st)  # type: ignore[arg-type]
+        r = ct.control("晾衣架", "up")
+        check("晾衣架 up→open_cover", fake.calls[-1][:2] == ("cover", "open_cover") and "开始上升" in r, f"{r} | {fake.calls[-1]}")
+        r = ct.control("晾衣架", "down")
+        check("晾衣架 down→close_cover", fake.calls[-1][:2] == ("cover", "close_cover") and "开始下降" in r, f"{r} | {fake.calls[-1]}")
+        r = ct.control("晾衣架", "off")
+        check("晾衣架 off→open_cover", fake.calls[-1][:2] == ("cover", "open_cover") and "上升" in r, f"{r} | {fake.calls[-1]}")
+        r = ct.control("窗帘", "up")
+        check("窗帘 up→close_cover", fake.calls[-1][:2] == ("cover", "close_cover"), f"{r} | {fake.calls[-1]}")
+        schema_actions = next(
+            s["function"]["parameters"]["properties"]["action"]["enum"]
+            for s in ct.schemas()
+            if s["function"]["name"] == "control"
+        )
+        check("schema 含 up/down/stop", {"up", "down", "stop"} <= set(schema_actions), str(schema_actions))
+
     ha.close()
     ok = all(r[1] for r in results)
     print("-" * 56)

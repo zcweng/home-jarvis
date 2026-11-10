@@ -15,9 +15,12 @@ from __future__ import annotations
 import re
 
 # 命令动词/结构（宁可多判）
+# 含升降：ASR 常把「上升」听成「上身」；「再升一次/再生一次」也要强制走 control
 _CONTROL = re.compile(
     r"(打开|开启|关掉|关上|关闭|关一下|开一下|调|设成|设为|换成|开到|调到|"
-    r"亮一点|亮一些|暗一点|暗一些|低一点|高一点|温度|亮度|色温|定时|提醒)"
+    r"亮一点|亮一些|暗一点|暗一些|低一点|高一点|温度|亮度|色温|定时|提醒|"
+    r"上升|下降|升起|降下|升上去|降下来|收起|放下|上身|下身|"
+    r"再(升|降|开|关|来|做|试|整)|再生一次|再来一次|停一下|停下)"
 )
 
 # 纯提问/陈述，不算命令
@@ -103,3 +106,59 @@ def looks_like_web_search(text: str) -> bool:
     if looks_like_time(t):
         return False
     return _WEB.search(t) is not None
+
+
+# ---------------------------------------------------------------- 多意图门控
+#
+# 只有「一句话里明显有好几件事」才值得走任务编排（先花一次规划 LLM）。
+# 判定方式是**按标点切小句、逐句看像不像一件事**，而不是数动词——
+# 数动词会把「把亮度调低一点」当成两件事，用户会莫名其妙听到两句播报。
+_CLAUSE = re.compile(r"[^。！？!?；;\n，,]+")
+
+# 已经在聊任务本身（查询/取消）时不编排：那属于 tasks 工具的活
+_TASK_META = re.compile(
+    r"(任务|进度|做到哪|还有几件|排队|剩下的|刚才.{0,4}(事|任务)|"
+    r"取消.{0,6}(任务|刚才|剩下)|全部取消|都取消)"
+)
+
+
+# 口语里的命令比 _CONTROL 松：「把客厅灯关了吧」「开一下」都不在里面。
+# 这里只用于"数几件事"，宁可多算一句，代价仅仅是多一次规划请求。
+_LOOSE_TASK = re.compile(
+    r"(打开|开一下|开启|开开|关掉|关上|关一下|关了|关闭|调到|调成|设成|设为|切到|切回|"
+    r"把.{0,10}(开|关|调|设)|升上去|降下来|升起|降下|收起来|放下来|亮一点|暗一点|"
+    r"播报|广播|提醒我|查一下|搜一下|看一下|"
+    r"几点|天气|下雨|气温)"
+)
+
+
+def _is_a_task(clause: str) -> bool:
+    return bool(
+        looks_like_command(clause)
+        or looks_like_weather(clause)
+        or looks_like_time(clause)
+        or looks_like_web_search(clause)
+        or _LOOSE_TASK.search(clause)
+    )
+
+
+def count_task_intents(text: str) -> int:
+    """数一句话里像「一件事」的小句有几条。"""
+    n = 0
+    for raw in _CLAUSE.findall(text or ""):
+        clause = raw.strip()
+        if len(clause) < 2:
+            continue
+        if _is_a_task(clause):
+            n += 1
+    return n
+
+
+def looks_like_multi_task(text: str) -> bool:
+    """是否该交给任务编排器（≥2 件互不相干的事）。"""
+    t = (text or "").strip()
+    if len(t) < 4:
+        return False
+    if _TASK_META.search(t):
+        return False
+    return count_task_intents(t) >= 2

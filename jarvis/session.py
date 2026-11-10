@@ -76,6 +76,12 @@ class Session:
             self.history.append({"role": "assistant", "content": text})
             self._trim()
 
+    def last_result_hint(self) -> str:
+        """给规划器的一行上下文（指代消解：用户说「再暗一点」指的是哪台）。"""
+        if not self.last.device:
+            return ""
+        return f"最近一次操作：{self.last.device} → {self.last.action}（结果：{self.last.result}）"
+
     def note_action(self, device: str, action: str, value: float | None, result: str) -> None:
         self.last = LastAction(device=device, action=action, value=value, result=result)
 

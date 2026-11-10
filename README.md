@@ -29,6 +29,9 @@
 | **可打断** | 播报中插话即停（自适应回声基线，纯回声不会自断） |
 | **拒控离线设备** | 设备断电时**如实拒绝**（「客厅灯现在不在线，我控制不了它」），不装执行成功 |
 | **防「编造已执行」** | 模型说「已经关了」但一次工具都没调时，守卫强制重问一次 |
+| **多任务编排** | 一句话几件事 → 拆成任务 DAG，后台并发跑（超阈值排队），**谁先有结果谁先念**；没依赖的并行、有依赖的串行 |
+| **任务查询 / 取消** | 「刚才那几件事做到哪了」→ 逐条报状态（进行中/排队中/已完成）；「取消第 2 件 / 全部取消」 |
+| **老大难自动拆** | 单条任务太大时由子 agent 再拆一层（默认最多 2 层），子任务只汇总一句，不逐条吵人 |
 
 延迟实测（MacBook Pro M4）：ASR 50~90ms · LLM 单轮 500~750ms、两轮工具往返 1.2~1.8s ·
 TTS 首字 ~200ms · **端到端首字 ≈1.5s**。
@@ -64,6 +67,10 @@ TTS 首字 ~200ms · **端到端首字 ≈1.5s**。
 设备一律按**中文名子串**匹配，绝不写设备索引（插拔一次索引就变）。
 LLM 走 **OpenAI Agents SDK**（Chat Completions 兼容），家电工具仍是本地 FunctionTool；
 外部数据源可通过 `MCP_SERVERS` 挂 MCP；默认走 Tool Search（`tool_search` + `call_discovered_tool`），MCP/长尾本地工具不进模型前缀，对齐 Anthropic `defer_loading` 语义。`TOOL_SEARCH_ENABLED=false` 可回退全量挂载。
+多任务编排（`jarvis/tasks/`）是旁路：主对话拆出任务后立刻回一句确认，
+任务在后台线程跑 LangGraph DAG，结果按完成先后**串行**播报；
+主会话历史只留一句总结，明细进 `data/tasks/*.jsonl`。见 [`docs/任务编排设计.md`](docs/任务编排设计.md)。
+
 将来接 ESP32-S3 当远端端点，只替换音频层，状态机与工具层不动。
 
 ---
@@ -84,10 +91,11 @@ LLM 走 **OpenAI Agents SDK**（Chat Completions 兼容），家电工具仍是�
 ```bash
 git clone https://github.com/zcweng/home-jarvis.git
 cd home-jarvis
-UV_CACHE_DIR=.uv-cache uv sync --extra asr --extra vad --extra kws --extra web
+UV_CACHE_DIR=.uv-cache uv sync --extra asr --extra vad --extra kws --extra web --extra tasks
 cp .env.example .env          # 然后填 HA_TOKEN / LLM_API_KEY（或 DEEPSEEK_KEY）
 python3 scripts/preflight.py  # 环境自检：Python/uv/ffmpeg/Docker/语音设备
 # 联网搜索（可选）：首次还需 .venv/bin/crawl4ai-setup
+# 多任务编排是 --extra tasks（langgraph）；不装也不影响主流程，只少这一项能力
 ```
 
 ### 2. 起 Home Assistant（可选一并起 SearXNG）
@@ -182,6 +190,15 @@ python scripts/gen_aliases.py             # 追加写入 config/aliases.yaml（�
 | `VAD_THRESHOLD` / `VAD_SILENCE_MS` | `0.5` / `500` | 断句灵敏度与静音阈值 |
 | `ANNOUNCE_ENTITY` | 空 | 指定播报音箱；留空自动发现带 `play_text` 的 notify 实体 |
 | `ACK_PHRASES` | `好的\|嗯\|收到` | 首句先出声的预渲染短应答 |
+| `TASK_ENABLED` | `true` | 多任务编排总开关；关掉完全等于单轮对话 |
+| `TASK_MAX_CONCURRENCY` | `2` | 同时最多跑几个工具任务，超出的排队（`status=queued`） |
+| `TASK_MAX_TASKS` | `8` | 一句话最多拆几件，防模型拆出 15 件 |
+| `TASK_MAX_DEPTH` | `2` | 子 agent 嵌套层数；`1`=不拆子任务 |
+| `TASK_ANNOUNCE` | `true` | `false`=任务照跑但不出声（夜间/自检） |
+| `TASK_ANNOUNCE_FAILURES` | `true` | 失败的任务也念一句结果 |
+| `TASK_IDLE_WAIT` | `12` | 等主对话说完再播任务结果，避免叠音 |
+| `TASK_LOG_DIR` | `data/tasks` | 每次任务的明细 jsonl；主会话只留一句总结 |
+| `TASK_PLAN_MODEL` / `TASK_PLAN_TIMEOUT` | 空 / `8` | 规划用的模型（空=复用 `LLM_MODEL`）与超时 |
 
 TTS 音色坑：`say` 下「个人语音」类音色（Eddy / Flo / Reed / Sandy / Rocko…）只渲染 **16ms 空音频**，
 必须用 Tingting / Meijia。`SayTTS` 启动时自带音色体检，异常自动回落并告警。
@@ -191,9 +208,12 @@ TTS 音色坑：`say` 下「个人语音」类音色（Eddy / Flo / Reed / Sandy
 ## 自检与回归
 
 ```bash
-./scripts/selftest_all.sh          # 一键跑 11 个套件：环境→音频→打断→唤醒→输出路由→
-                                   # 文本归一化→KWS→工具层→语音往返→模型断言→全链路
-./scripts/selftest_all.sh --fast   # 跳过要真实模型和出声的项（不烧 token）
+./scripts/selftest_all.sh          # 一键跑 18 个套件：环境→音频→打断→唤醒→输出路由→文本归一化→
+                                   # TTS 热切换→Nano→KWS→工具层→本地时间→端点→Agents 运行时→
+                                   # 多任务编排→多任务编排(真模型+真设备)→语音往返→模型断言→全链路
+./scripts/selftest_all.sh --fast   # 跳过要真实模型、真设备和出声的项（不烧 token、不动家电）
+.venv/bin/python scripts/selftest_tasks.py          # 只跑多任务编排（离线 95 项）
+.venv/bin/python scripts/selftest_tasks.py --real   # 加真模型规划 + 真设备（会开关一盏在线灯）
 ```
 
 CI 只跑**离线、无需音频设备**的部分（`python -m compileall`、文本归一化、别名命名逻辑），
@@ -233,7 +253,9 @@ jarvis/                会话与适配器
   agent_runtime.py     OpenAI Agents SDK（可切换 LLM + 可选 MCP）
   agent_tools.py       Tools → FunctionTool
   llm.py  intent.py    LLMResult 类型 + 「编造已执行」守卫
-  tools.py             工具层：control / query / announce / 定时 / get_time
+  tools.py             工具层：control / query / announce / 定时 / get_time / tasks
+  tasks/               多任务编排：plan（拆分校验）graph（LangGraph）runner（并发闸门）
+                       announce（串行播报）service（提交/查询/取消）model（状态机）
   tts_registry.py tts_neural/nano/qwen/say 可热切换 TTS（含千问 Realtime）
   textnorm.py          数字/单位 → 中文读法
   output.py            SpeechRouter 输出路由
@@ -257,6 +279,7 @@ models/                模型权重（脚本下载，不入库）
 | [`docs/接米家设备-操作手册.md`](docs/接米家设备-操作手册.md) | 米家 OAuth 五步 + 6 个排障项 |
 | [`docs/TTS-选型与实测.md`](docs/TTS-选型与实测.md) | 四条 TTS 路线实测对比（含首包与音质） |
 | [`docs/S12-AEC数据流方案.md`](docs/S12-AEC数据流方案.md) | S12 音箱 AEC 数据流：为什么用 ch7 数字环回、16k 直采、AEC 实测参数 |
+| [`docs/任务编排设计.md`](docs/任务编排设计.md) | 一句话拆任务 DAG：为什么 LangGraph、并发闸门、顺序播报、取消语义、子任务、上下文控制 |
 | [`docs/S12-设备状态契约.md`](docs/S12-设备状态契约.md) | `/tmp` 状态文件的唯一写者表、音量语义、UDP 回传协议 |
 | [`docs/OH2P-刷机评估.md`](docs/OH2P-刷机评估.md) | 小爱音箱 Pro 能不能当耳朵/喇叭，风险几何 |
 | [`docs/家庭智能管家-技术方案.md`](docs/家庭智能管家-技术方案.md) | 总方案：路线对比、延迟预算、合规 |
@@ -293,6 +316,22 @@ tools/s12common-regression.sh 192.168.1.3
 端口：`8765` 上行音频 · `8766` 下行音频 · `8769` UDP 状态回传。**没有 HTTP 观测面**，
 设备侧诊断用 `kill -USR1 <pid>` 打一次 STATS。
 
+`s12audio` 的采集链与两个开关（细节与实测见
+[`docs/S12-AEC数据流方案.md`](docs/S12-AEC数据流方案.md) §4.8/§4.9）：
+
+```
+hw:0,0 8ch S32 → ch0-5 去 DC → 数字增益 20 → 每路独立 AEC（ch7 环回当参考）
+   → 延迟求和波束（GCC-PHAT 估 TDOA，500ms 一更，含电平补偿）
+   → 降噪（默认关） → 后置增益 → 8765 上行
+```
+
+| 开关 | 默认 | 说明 |
+|---|---|---|
+| `-b` / `-B` | 波束**开** | `-B` 退回旧的「每帧选最响一路」。实测两者唤醒率 6/12 vs 7/12（n=12，分不出显著差异）；波束的价值是「不逐帧换通道、6 路都用上」 |
+| `-N DB` / `-n` | 降噪**关** | **这是远场唤醒的真凶**：`-20dB` 降噪时梯度录音 −12dB 级唤醒 0/3，关掉后 2/3；而整句 ASR 逐字一致。噪声大的房间可 `-N -10` |
+| `-c N` / `-a` | 自适应 | 固定单通道 / 六路平均（两者都不走波束，语义优先） |
+| `-g X` / `-p DB` | 20 / 0 | 麦克风数字增益 / 后置增益 |
+
 ---
 
 ## 踩过的坑与对策（选摘）
@@ -308,6 +347,13 @@ tools/s12common-regression.sh 192.168.1.3
 - **sherpa-onnx 的 macOS wheel 没编 espeak 前端** → 只能用带 `lexicon.txt` 的模型（aishell3 / fanchen-C）。
 - **Docker 凭据助手坏了**（`credsStore: desktop`）→ `DOCKER_CONFIG=/tmp/dcfg docker compose ...` 绕过。
 - **HA 的 `demo:` YAML 删不掉**——它会被自动导入成 config entry，得在设备与服务里删条目。
+- **DeepSeek 默认开思考会把 JSON 输出吃光**：规划请求 `finish_reason=length`、700 个 token
+  全是 `reasoning_tokens`、`content` 为空 → 「模型没给出合法 JSON」还白等 6 秒。
+  凡是要 JSON 的请求都要带 `extra_body={"thinking":{"type":"disabled"}}`（`jarvis/llm.no_thinking_body`）。
+- **任务播报必须等主对话说完**：否则「三件事的结果」和当前回答撞在一起；播报期间还要**丢掉麦克风输入**，
+  不然喇叭会把自己的声音当成用户说话（和播报回声同一个坑）。
+- **别用图引擎的 `max_concurrency` 当并发闸门**：嵌套子图各算各的，父等子时容易自等死锁；
+  闸门要压在**叶子工具执行**上。
 
 ---
 
@@ -327,6 +373,7 @@ tools/s12common-regression.sh 192.168.1.3
 ## 路线图
 
 - [x] **P0** 本机软件闭环：音频 → ASR → 唤醒门 → LLM+工具 → TTS → 音箱，全链路跑通
+- [x] **P0.4** 多任务编排：一句话拆任务 DAG、并发排队、按完成顺序播报、语音查询/取消、子任务
 - [ ] **P0.5** 迁移到常开 MacMini（clone → `uv sync` → `fetch_models.sh` → 改 `.env` → compose up）
 - [ ] **P1** ESP32-S3-N16R8 当「耳朵和嘴」：只替换音频层，音频走 WebSocket 送主机
 - [ ] **P2** 定时提醒上台架、行程/家电状态主动播报、多房间说话人区分

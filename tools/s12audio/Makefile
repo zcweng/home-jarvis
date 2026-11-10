@@ -16,8 +16,8 @@ LDFLAGS += $(shell pkg-config --libs alsa 2>/dev/null) -lspeexdsp -lm -lpthread
 LDFLAGS += -s
 
 BIN := build/s12audio
-SRC := s12audio.c
-HDR := $(wildcard ../common/*.h) mute_sfx_pcm.h vol_dong_pcm.h
+SRC := s12audio.c beam.c
+HDR := $(wildcard ../common/*.h) beam.h mute_sfx_pcm.h vol_dong_pcm.h
 
 all: $(BIN)
 

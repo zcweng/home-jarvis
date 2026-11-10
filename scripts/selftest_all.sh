@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # 一键回归：按"硬件 → 语音 → 设备 → 模型 → 全链路"的顺序跑所有自检。
 #
-#   ./scripts/selftest_all.sh            # 跑全部
-#   ./scripts/selftest_all.sh --fast     # 跳过会调真实模型和出声的项
+#   ./scripts/selftest_all.sh            # 跑全部（会调真实模型、会开关真实设备、会出声）
+#   ./scripts/selftest_all.sh --fast     # 跳过真实模型/真设备/出声的项（夜里就该用这个）
 #
 # 出问题时从下往上查：链路失败 → 先看工具层 → 再看模型层 → 最后看语音层。
 set -uo pipefail
@@ -45,8 +45,10 @@ run "设备工具层"          $PY scripts/selftest_tools.py
 run "本地时间工具"        $PY scripts/selftest_get_time.py
 run "网络音频端点"        $PY scripts/selftest_endpoint.py
 run "Agents 运行时"       $PY scripts/selftest_agent_runtime.py
+run "多任务编排"          $PY scripts/selftest_tasks.py
 
 if [[ $FAST -eq 0 ]]; then
+  run "多任务编排（真模型+真设备）" $PY scripts/selftest_tasks.py --real
   run "语音合成/识别往返"  $PY scripts/selftest_speech.py
   run "模型断言"          $PY scripts/selftest_llm.py
   run "全链路"            $PY scripts/selftest_chain.py --real-llm

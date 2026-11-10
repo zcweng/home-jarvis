@@ -2,11 +2,11 @@
 
 from __future__ import annotations
 
-import json
 import re
 import sys
-from typing import Any, Callable
+from typing import Callable
 
+from ..jsonx import parse_json_object
 from .types import ClassifyResult, PERM_TYPES, SHORT_TYPES
 
 LLMFn = Callable[[str], str]  # prompt → raw text
@@ -189,28 +189,7 @@ _LLM_PROMPT = """你是家庭语音管家的记忆分类器。根据用户话和
 """
 
 
-def _parse_llm_json(raw: str) -> dict[str, Any] | None:
-    text = (raw or "").strip()
-    if not text:
-        return None
-    # 剥 code fence
-    if "```" in text:
-        m = re.search(r"```(?:json)?\s*([\s\S]*?)```", text)
-        if m:
-            text = m.group(1).strip()
-    try:
-        data = json.loads(text)
-        return data if isinstance(data, dict) else None
-    except json.JSONDecodeError:
-        # 尝试截取第一个 { ... }
-        m = re.search(r"\{[\s\S]*\}", text)
-        if not m:
-            return None
-        try:
-            data = json.loads(m.group(0))
-            return data if isinstance(data, dict) else None
-        except json.JSONDecodeError:
-            return None
+
 
 
 def llm_classify(user_text: str, reply: str, llm: LLMFn) -> ClassifyResult | None:
@@ -219,7 +198,7 @@ def llm_classify(user_text: str, reply: str, llm: LLMFn) -> ClassifyResult | Non
     except Exception as e:  # noqa: BLE001
         _warn(f"LLM 调用失败：{e}")
         return None
-    data = _parse_llm_json(raw)
+    data = parse_json_object(raw)
     if not data:
         _warn("LLM 返回非 JSON，已忽略")
         return None

@@ -105,6 +105,16 @@ if [ ! -f "$ROOT/tools/s12led/build/volumed" ]; then
   bad "缺少 tools/s12led/build/volumed，先编译"
 else
   cat "$ROOT/tools/s12led/build/volumed" | rsh '/bin/cat > /data/volumed_t; /bin/chmod +x /data/volumed_t'
+  # 生产 volumed 正握着 event0 的 EVIOCGRAB，临时实例必然 grab 不到 →
+  # 会报成「grab 异常」这种假失败（实测过：G1=0 ALIVE=0 G2=0）
+  # 或「grab 或释放异常：G1=0 ALIVE=0 G2=0」。
+  # 只停 volumed、**不要 stop 整个服务**：stop 会交还给原厂 pns，pns 立刻
+  # 占住 hw:0,0，紧接着 start 的 5 次重启全失败 → 整机回滚到 pns（实测踩过）。
+  svc_was_up=0
+  if rsh 'ps w | grep -q "[j]arvis-volumed"'; then
+    svc_was_up=1
+    rsh 'killall jarvis-volumed >/dev/null 2>&1; sleep 2'
+  fi
   out=$(rsh '
     echo 0 > /tmp/jarvis-mic.mute
     /data/volumed_t > /data/vlm_t.log 2>&1 &
@@ -123,6 +133,10 @@ else
     echo "G1=$G1 ALIVE=$ALIVE G2=$G2"
   ')
   echo "     $out"
+  if [ "$svc_was_up" = 1 ]; then
+    # 照 init 脚本的方式拉回来（它也是 ( trap '' HUP; exec $VOLUMED ) &）
+    rsh 'cd /data && ( trap "" HUP; exec /data/jarvis-volumed ) </dev/null >>/data/log/jarvis-audio.log 2>&1 & sleep 1'
+  fi
   case "$out" in
     *"G1=1 ALIVE=0 G2=1"*) ok "grab 成功 / 干净退出 / grab 已释放" ;;
     *"ALIVE=1"*) bad "SIGTERM 后仍存活（read 未改成 poll？）" ;;
@@ -161,4 +175,8 @@ if [ "$fail" = 0 ]; then
 else
   echo "有失败项，见上"
 fi
+# EXIT trap 会把设备交还原厂 pns（设计如此：保证失败时也有音频）。
+# 但家里那套 Jarvis 耳朵靠 s12audio，跑完回归要能一眼看到怎么切回来。
+echo "注意：结束时设备已交还原厂 pns。切回 Jarvis 音频："
+echo "  ssh root@$HOST '/etc/init.d/pns stop; /etc/init.d/jarvis-audio start'"
 exit "$fail"

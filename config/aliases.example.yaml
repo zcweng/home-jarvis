@@ -46,6 +46,8 @@
 晾衣架:
   entity: cover.hyd_cn_100000005_znlyj1_s_2_airer
   type: cover
+  # 米家晾衣架实测：上升=open_cover，下降=close_cover（普通窗帘可省略或写 cover_up: open）
+  cover_up: open
   aliases: [晾衣架]
 
 # 音箱：announce 工具会自动发现带 play_text 的 notify 实体；

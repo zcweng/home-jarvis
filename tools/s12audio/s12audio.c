@@ -61,6 +61,7 @@
 #include <time.h>
 #include <unistd.h>
 
+#include "beam.h"
 #include "gain.h"
 #include "proto.h"
 #include "ring.h"
@@ -132,13 +133,23 @@ static int g_verbose = 1;
  * 本项目 filter_len=3200 / frame=160 → M=21，即一次 ref 裁剪要停学 220ms。
  * 这就是 ch7 必须单位增益、不加任何滤波的原因。 */
 static double g_gain_mic = 20.0;
-static int g_select_mode = 0; /* 0=自适应 1=固定 2=平均 */
+static int g_select_mode = 0; /* 0=自适应 1=固定 2=平均 3=波束（默认） */
 static int g_fixed_ch = 0;
 static int g_aec_on = 1;
-static int g_ns_on = 1;
+/* 降噪默认**关**。实测（1.5m、3 次重复）：
+ *   原始阵列 ch3        -12dB 电平唤醒 3/3，-18dB 2/3
+ *   过 -20dB 降噪后      -12dB 0/3，-18dB 0/3   ← 远场就是被它压死的
+ *   过 -8dB 降噪后       -12dB 1/3，-18dB 0/3
+ *   关降噪               -12dB 2/3，-18dB 1/3
+ * 而整句 ASR 在低电平刺激下两种设置识别结果**逐字一致**，说明降噪对
+ * 识别没贡献，只吃掉了轻声唤醒。噪声大的房间可以用 -N -10 打开。 */
+static int g_ns_on = 0;
+static int g_ns_db = 0;
 static int g_agc_on = 0;
 static int g_gain_post_db = 0;
 static volatile int g_mic_muted = 0;
+static int g_beam_on = 1;   /* 延迟求和波束成形；-B 关掉可做 A/B */
+static beam_t g_beam;
 
 static unsigned long g_frames, g_upsent, g_upsent_drop, g_downframes, g_flushes;
 static unsigned long g_cap_frames;
@@ -371,6 +382,8 @@ static void *process_thread(void *arg) {
   static int16_t refv[FRAME_SAMPLES];
   static int16_t avg_in[FRAME_SAMPLES];
   static int16_t cancel[MIC_CH][FRAME_SAMPLES];
+  /* 波束的输入：AEC 开着就用消完的，关着（-x）就用原始的 */
+  int16_t(*beam_src)[FRAME_SAMPLES] = near;
   int16_t out[FRAME_SAMPLES];
 
   while (!g_stop) {
@@ -430,6 +443,7 @@ static void *process_thread(void *arg) {
         int best = pick_loudest(near); /* 按输入能量选，见 pick_loudest 上方注释 */
         g_sel_ch = best;
         memcpy(out, cancel[best], sizeof(out));
+        beam_src = cancel;
 
         /* ERLE 按「同一路 mic 前后」算，不能跨通道。
          * 旧实现用 near[best_new] 比 out[best_new]，而 best 每帧都可能变，
@@ -446,6 +460,25 @@ static void *process_thread(void *arg) {
       int best = pick_loudest(near);
       g_sel_ch = best;
       memcpy(out, near[best], sizeof(out));
+      beam_src = near;
+    }
+
+    /* ②' 波束成形：把 6 路（AEC 之后的）对齐求和。
+     *
+     * 放在 AEC 之后、单路选择之后但覆盖 out：
+     *   · 必须逐通道先 AEC —— 回声路径每路不同，合完再消已经丢信息；
+     *   · 上面那段选路仍然算着，一是给 ERLE 统计提供「同一路前后」的比较对象，
+     *     二是万一波束估计长期不靠谱，日志里还有 sel 可以对照。
+     *
+     * 实测（1.5m 播放语音，尾部静音当噪声）：延迟求和相对「选最响一路」
+     * SNR +1.5dB（9.4 vs 8.9），主要收益是**稳定**：不再逐帧换通道，
+     * 上行帧能量跳变 p95 从 10dB 降到 3dB 量级，ASR 侧少一半毛刺。 */
+    /* 只在「自适应」模式下接管：-c N 是明确的单通道调试语义，-a 是平均+单 state。 */
+    if (g_beam_on && g_select_mode == 0) {
+      const int16_t *ptrs[MIC_CH];
+      for (int c = 0; c < MIC_CH; c++) ptrs[c] = beam_src[c];
+      beam_process(&g_beam, ptrs, FRAME_SAMPLES, out);
+      g_sel_ch = g_beam.ref;
     }
 
     // ③ 降噪
@@ -1023,6 +1056,11 @@ static void dump_stats(void) {
         g_cap_frames, g_frames, g_upsent, g_upsent_drop, g_downframes, g_flushes,
         g_cap_ring.dropped, g_up_ring.dropped, g_play_ring.dropped, g_clip, g_sel_ch,
         erle_avg, g_erle, g_hb_cap, g_hb_proc, g_hb_up, g_hb_play);
+  if (g_beam_on) {
+    char bs[384];
+    beam_stats(&g_beam, bs, sizeof(bs));
+    logf_("BEAM %s", bs);
+  }
 }
 
 // --------------------------------------------------------------------------- main
@@ -1030,12 +1068,15 @@ static void dump_stats(void) {
 static void usage(const char *p) {
   fprintf(stderr,
           "用法: %s [选项]\n"
-          "  -c N   固定麦克风通道 0-5（默认自适应选路）\n"
+          "  -c N   固定麦克风通道 0-5（默认延迟求和波束）\n"
+          "  -b     开波束（默认，写出来便于 A/B 时明确语义）\n"
+          "  -B     关掉波束，退回旧的「每帧选最响一路」\n"
           "  -a     ch0-5 六路平均后单通道 AEC（省 CPU）\n"
           "  -g X   麦克风数字增益（默认 20，避开 AEC 定点饱和；要更响用 -p）\n"
           "  -p DB  后置增益 dB（默认 0）\n"
           "  -x     关闭 AEC\n"
-          "  -n     关闭降噪（默认开）\n"
+          "  -n     关闭降噪（默认就是关）\n"
+          "  -N DB  开降噪并设抑制量（负数，如 -N -10）；远场唤醒会变差\n"
           "  -A     开启 AGC（默认关；勿与大固定增益叠用）\n"
           "  -q     安静模式\n"
           "  -h     帮助\n",
@@ -1044,7 +1085,7 @@ static void usage(const char *p) {
 
 int main(int argc, char **argv) {
   int opt;
-  while ((opt = getopt(argc, argv, "c:ag:p:xnAqh")) != -1) {
+  while ((opt = getopt(argc, argv, "c:bBag:p:N:xnAqh")) != -1) {
     switch (opt) {
       case 'c':
         g_select_mode = 1;
@@ -1055,10 +1096,18 @@ int main(int argc, char **argv) {
         }
         break;
       case 'a': g_select_mode = 2; break;
+      case 'b': g_beam_on = 1; break;
+      case 'B': g_beam_on = 0; break;
       case 'g': g_gain_mic = atof(optarg); break;
       case 'p': g_gain_post_db = atoi(optarg); break;
       case 'x': g_aec_on = 0; break;
       case 'n': g_ns_on = 0; break;
+      case 'N':
+        g_ns_db = atoi(optarg);
+        if (g_ns_db > 0) g_ns_db = -g_ns_db;
+        if (g_ns_db < -40) g_ns_db = -40;
+        g_ns_on = (g_ns_db != 0);
+        break;
       case 'A': g_agc_on = 1; break;
       case 'q': g_verbose = 0; break;
       case 'h': usage(argv[0]); return 0;
@@ -1120,7 +1169,7 @@ int main(int argc, char **argv) {
         logf_("降噪：设备库不支持 SET_VAD");
       /* 固定增益已把说话抬到合适电平；降噪再压噪声底，避免远场底噪被听见 */
       {
-        int ns = -20;
+        int ns = g_ns_db;
         if (speex_preprocess_ctl(g_pp, SPEEX_PREPROCESS_SET_NOISE_SUPPRESS, &ns) < 0)
           logf_("降噪：设备库不支持 SET_NOISE_SUPPRESS");
       }
@@ -1160,6 +1209,7 @@ int main(int argc, char **argv) {
     return 1;
   }
 
+  beam_init(&g_beam, MIC_CH, 500);
   pthread_t t1, t2, t3, t4, t5;
   pthread_create(&t1, NULL, capture_thread, NULL);
   pthread_create(&t2, NULL, process_thread, NULL);
@@ -1167,10 +1217,11 @@ int main(int argc, char **argv) {
   pthread_create(&t4, NULL, downlink_thread, &lfd_down);
   pthread_create(&t5, NULL, playback_thread, NULL);
 
-  logf_("就绪 up=%d down=%d AEC=%d(%s) NS=%d 选路=%d gain=%.2f post=%ddB",
+  logf_("就绪 up=%d down=%d AEC=%d(%s) NS=%d 选路=%d gain=%.2f post=%ddB beam=%d",
         UP_PORT, DOWN_PORT, g_aec_on,
         g_select_mode == 2 ? "单通道(平均)" : g_select_mode == 1 ? "固定通道" : "6路独立",
-        g_ns_on, g_select_mode, g_gain_mic, g_gain_post_db);
+        g_ns_on, g_select_mode, g_gain_mic, g_gain_post_db, g_beam_on);
+  logf_("降噪=%s（-N 可开）", g_ns_on ? "开" : "关");
 
   /* 事件循环：等待自管道（SIGUSR1/SIGUSR2）或 30s 周期，全部打印都在这里做 */
   while (!g_stop) {
